@@ -1,0 +1,42 @@
+{
+  // Worker 名称（也是默认的 *.workers.dev 子域名前缀），可自行修改
+  "name": "vertex-master-cf",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  // 允许使用部分 Node 风格 API（Buffer 兼容等）
+  "compatibility_flags": ["nodejs_compat"],
+  // 生产构建压缩：减小上传包体、加快冷启动（isolate 首次解析的字节码更少）
+  "minify": true,
+  // 观测：Dashboard 上可直接看请求日志，免费计划可用
+  "observability": {
+    "enabled": true
+  },
+  // ⚠️ 部署前必须：先 `wrangler kv namespace create VPROXY_KV`，
+  // 然后把下面 id 换成命令输出的真实 id
+  "kv_namespaces": [
+    {
+      "binding": "VPROXY_KV",
+      "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+    }
+  ],
+  // 自定义域名（可选）：Cloudflare 会自动创建 DNS 记录与证书
+  // "routes": [
+  //   { "pattern": "your-domain.example.com", "custom_domain": true }
+  // ],
+  // 非敏感配置可以放 vars（敏感的一律用 `wrangler secret put`）
+  "vars": {},
+  // Smart Placement —— 把 Worker 执行位置迁移到后端（Google API）附近运行。
+  // 对「客户端在被 Google 地理封锁的地区（如中国大陆/香港）」的部署尤其关键：
+  // 没有它，Worker 在离客户端最近的 PoP（往往是 HKG）执行，直连 fetch 出口 IP 被
+  // Google 以 "User location is not supported" 拒绝；开启后执行点靠近 Google（美国）。
+  // 需要少量真实流量供 Cloudflare 完成画像后生效。
+  "placement": {
+    "mode": "smart"
+  },
+  // Cron Triggers（免费计划可用）：驱动定时健康巡检 / 订阅差异更新 / keepalive 保活。
+  // 默认每 15 分钟一跳（对齐原项目巡检间隔）；实际节奏由面板里的 interval_minutes /
+  // keepalive_interval 控制（KV 时间戳判重，cron 只负责心跳）。
+  "triggers": {
+    "crons": ["*/15 * * * *"]
+  }
+}

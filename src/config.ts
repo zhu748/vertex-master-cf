@@ -1,0 +1,196 @@
+// KV 配置管理：
+//   - 配置持久化在 KV 的 "config" 键上，可通过 /admin/config 或 Web 面板热更新，无需重新部署；
+//   - 首次访问时若 KV 无配置，则用环境变量兜底初始化；
+//   - isolate 内存缓存 60 秒，避免每个请求都读 KV（KV 免费额度：10 万读/天）；
+//   - 上游 Gemini Key 为单个（对齐原项目“单 Key 直连”模式），兼容读取旧版 gemini_keys 数组；
+//   - 保存/加载时自动清洗代理列表：https:// 等不支持的链接直接剔除（Workers 无法 TLS-in-TLS）。
+import { cleanProxyList } from "./egress/pool.ts";
+import { DEFAULT_RACING, sanitizeRacingConfig, DEFAULT_HEALTH_CHECK, sanitizeHealthCheckConfig } from "./racing.ts";
+import { DEFAULT_CLAUDE_PROMPT_POLICY, sanitizeClaudePromptPolicy } from "./promptpolicy.ts";
+import type { ApiMode, VProxyConfig } from "./types.ts";
+
+export interface Env {
+  VPROXY_KV: KVNamespace;
+  // 兜底配置（均可选；KV 配置优先）
+  API_KEYS?: string; // 逗号分隔（客户端鉴权 Key）
+  API_MODE?: string; // 上游通道模式：anon（默认）/ official（原项目 VPROXY_GEMINI_API_MODE 语义）
+  GEMINI_API_KEY?: string; // official 模式：单个上游 Key
+  GEMINI_API_KEYS?: string; // 兼容旧：逗号分隔，取第一个
+  GEMINI_BASE_URL?: string; // 可选：official 模式上游镜像/中转基地址
+  PROXY_URLS?: string; // 逗号分隔
+  ADMIN_TOKEN?: string; // 管理端点鉴权 token
+}
+
+export const CONFIG_KEY = "config";
+
+const CACHE_TTL_MS = 60_000;
+
+let cached: { value: VProxyConfig; at: number } | null = null;
+
+export function parseList(raw: string | undefined): string[] {
+  if (!raw) return [];
+  return raw
+    .split(/[,\n]/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+function clampNum(v: unknown, def: number, lo: number, hi: number): number {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.floor(Math.min(hi, Math.max(lo, n))) : def;
+}
+
+export function defaultConfig(env: Env): VProxyConfig {
+  return {
+    apimode: sanitizeApiMode(env.API_MODE) ?? "anon",
+    gemini_key: parseList(env.GEMINI_API_KEY)[0] ?? parseList(env.GEMINI_API_KEYS)[0] ?? "",
+    anon_api_key: "",
+    anon_base_url: "",
+    count_tokens_query_signature: "",
+    api_keys: parseList(env.API_KEYS),
+    proxies: cleanProxyList(parseList(env.PROXY_URLS)).kept, // env 兜底也过一遍清洗
+    subscription: "",
+    model_aliases: {},
+    disabled_models: [],
+    // v2.5.1：默认每小时拉取（用户需求：每小时自动拉一次代理列表）。
+    // cron 每 15 分钟心跳一次，subscriptionDue 判距上次拉取 ≥60 分钟才真正拉。
+    subscription_refresh_minutes: 60,
+    racing: { ...DEFAULT_RACING },
+    drop_max_tokens: false,
+    max_request_mb: 64,
+    max_concurrent_requests: 16,
+    aggregate_stream: false,
+    gemini_base_url: sanitizeBaseUrl(env.GEMINI_BASE_URL),
+    max_n: 8,
+    health_check: { ...DEFAULT_HEALTH_CHECK },
+    keepalive_url: "",
+    keepalive_interval: 60,
+    claude_prompt: { ...DEFAULT_CLAUDE_PROMPT_POLICY, replacements: [] },
+  };
+}
+
+export function sanitizeApiMode(raw: unknown): ApiMode | null {
+  const v = String(raw ?? "").trim().toLowerCase();
+  if (v === "anon" || v === "anonymous") return "anon";
+  if (v === "official" || v === "api") return "official";
+  return null;
+}
+
+export function sanitizeBaseUrl(raw: unknown): string {
+  if (typeof raw !== "string") return "";
+  let v = raw.trim().replace(/\/+$/, "");
+  if (!v) return "";
+  if (!/^https?:\/\//i.test(v)) return ""; // 仅接受 http(s)，其余视为无效回退官方
+  try {
+    const u = new URL(v);
+    // 裸域名（无路径）自动补 /v1beta，便于直接填镜像站域名
+    if (u.pathname === "" || u.pathname === "/") v = u.origin + "/v1beta";
+  } catch {
+    return "";
+  }
+  return v;
+}
+
+export function sanitizeConfig(raw: unknown): VProxyConfig {
+  const d = raw && typeof raw === "object" ? (raw as Partial<VProxyConfig> & { gemini_keys?: unknown }) : {};
+  const arr = (v: unknown): string[] =>
+    Array.isArray(v) ? v.filter((x) => typeof x === "string" && x.trim()).map((x) => x.trim()) : [];
+  let refresh = Number(d.subscription_refresh_minutes);
+  // v2.5.1：非法/过小值的兑底同步 60（与 defaultConfig 一致；旧部署存了 30 的仍按 30 执行，
+  // 可在面板「配置」页改为 60，或删 KV config 键重初始化）
+  if (!Number.isFinite(refresh) || refresh < 5) refresh = 60;
+  // 单 Key：优先读 gemini_key；旧配置只有 gemini_keys 数组时取第一个
+  const geminiKey =
+    typeof d.gemini_key === "string" && d.gemini_key.trim()
+      ? d.gemini_key.trim()
+      : Array.isArray(d.gemini_keys) && typeof d.gemini_keys[0] === "string"
+        ? d.gemini_keys[0].trim()
+        : "";
+  return {
+    apimode: sanitizeApiMode(d.apimode) ?? "anon",
+    gemini_key: geminiKey,
+    anon_api_key: typeof d.anon_api_key === "string" ? d.anon_api_key.trim() : "",
+    anon_base_url: sanitizeBaseUrl(d.anon_base_url),
+    count_tokens_query_signature: typeof d.count_tokens_query_signature === "string" ? d.count_tokens_query_signature.trim() : "",
+    api_keys: arr(d.api_keys),
+    proxies: cleanProxyList(arr(d.proxies)).kept, // 自动剔除 https:// 等不支持条目
+    subscription: typeof d.subscription === "string" ? d.subscription.trim() : "",
+    model_aliases:
+      d.model_aliases && typeof d.model_aliases === "object" && !Array.isArray(d.model_aliases)
+        ? Object.fromEntries(
+            Object.entries(d.model_aliases as Record<string, unknown>)
+              .filter(([, v]) => typeof v === "string" && v.trim())
+              .map(([k, v]) => [k.trim(), String(v).trim()]),
+          )
+        : {},
+    disabled_models: arr(d.disabled_models),
+    subscription_refresh_minutes: Math.floor(refresh),
+    racing: sanitizeRacingConfig(d.racing),
+    drop_max_tokens: !!d.drop_max_tokens,
+    max_request_mb: clampNum(d.max_request_mb, 64, 1, 1024),
+    max_concurrent_requests: clampNum(d.max_concurrent_requests, 16, 1, 1000),
+    aggregate_stream: !!d.aggregate_stream,
+    gemini_base_url: sanitizeBaseUrl(d.gemini_base_url),
+    max_n: clampNum(d.max_n, 8, 1, 32),
+    health_check: sanitizeHealthCheckConfig(d.health_check),
+    keepalive_url: typeof d.keepalive_url === "string" ? d.keepalive_url.trim() : "",
+    keepalive_interval: clampNum(d.keepalive_interval, 60, 5, 86_400),
+    claude_prompt: sanitizeClaudePromptPolicy(d.claude_prompt),
+  };
+}
+
+export async function loadConfig(env: Env, force = false): Promise<VProxyConfig> {
+  if (!force && cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.value;
+  let raw: unknown = null;
+  let readFailed = false;
+  try {
+    raw = await env.VPROXY_KV.get(CONFIG_KEY, "json");
+  } catch {
+    // ⚠️ 关键：KV 读瞬时失败 ≠「KV 无配置」。若当成缺失走默认值并写回，
+    // 会用默认配置覆盖用户已保存的配置（破坏性 bug，v1.6.0 修复）。
+    readFailed = true;
+    raw = null;
+  }
+  let cfg: VProxyConfig;
+  if (raw) {
+    cfg = sanitizeConfig(raw);
+    // 环境变量作为缺失字段的兜底（KV 已配置的字段优先）
+    const d = defaultConfig(env);
+    if (!sanitizeApiMode((raw as Record<string, unknown>).apimode)) cfg.apimode = d.apimode;
+    if (!cfg.gemini_key) cfg.gemini_key = d.gemini_key;
+    if (cfg.api_keys.length === 0) cfg.api_keys = d.api_keys;
+    if (cfg.proxies.length === 0) cfg.proxies = d.proxies;
+  } else {
+    cfg = defaultConfig(env);
+    // 仅在「确认 KV 里确实没有配置」时才初始化写回；读失败时只服务默认值、不落盘
+    if (!readFailed) {
+      try {
+        await env.VPROXY_KV.put(CONFIG_KEY, JSON.stringify(cfg));
+      } catch {
+        // KV 写失败不阻塞请求
+      }
+    }
+  }
+  // 读失败时只缓存 5 秒（而不是 60 秒）：下个请求很快重试 KV，又不至于失败风暴时每请求都打 KV
+  cached = readFailed ? { value: cfg, at: Date.now() - CACHE_TTL_MS + 5_000 } : { value: cfg, at: Date.now() };
+  return cfg;
+}
+
+export async function saveConfig(env: Env, cfg: VProxyConfig): Promise<void> {
+  await env.VPROXY_KV.put(CONFIG_KEY, JSON.stringify(cfg));
+  cached = { value: cfg, at: Date.now() };
+}
+
+export function invalidateConfigCache(): void {
+  cached = null;
+}
+
+// 上游通道模式判定（原项目 gemini_api_mode 语义）：anon = 匿名端点（免 Key）
+export function isAnonMode(cfg: VProxyConfig): boolean {
+  return cfg.apimode === "anon";
+}
+
+// official 模式上游 Gemini Key（单 Key 直连）
+export function pickGeminiKey(cfg: VProxyConfig): string {
+  return cfg.gemini_key;
+}
