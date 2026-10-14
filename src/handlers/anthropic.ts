@@ -8,6 +8,7 @@ import {
   geminiSseToAnthropicEvents,
   geminiToAnthropic,
 } from "../convert/anthropic.ts";
+import { anthropicPingFrame } from "../fakestream.ts";
 import type { ARequest } from "../types.ts";
 import { callGemini, mapUpstreamError, resolveModel, type HandlerCtx } from "../upstream.ts";
 import { recordUsage, scheduleFlush } from "../usage.ts";
@@ -100,6 +101,8 @@ export async function handleAnthropicMessages(req: Request, ctx: HandlerCtx): Pr
   }
 
   // v1.7.0：统一走 sseResponseFromGenerator（ping 保活 + 断开取消上游）
+  // v1.3.0：Anthropic 端点改发协议级 ping 事件（对齐 Go 版 emitPing，Claude Code SDK 依赖）；
+  //         间隔 15s 与 Go 版 anthropicStreamState 一致
   let usageRecorded = false;
   const recordStreamUsage = () => {
     if (usageRecorded) return;
@@ -107,7 +110,10 @@ export async function handleAnthropicMessages(req: Request, ctx: HandlerCtx): Pr
     recordUsage(ctx.clientKey, resolved.model, usage?.input ?? 0, usage?.output ?? 0);
     ctx.waitUntil(scheduleFlush(ctx.env));
   };
-  return sseResponseFromGenerator(gen, upstream, recordStreamUsage);
+  return sseResponseFromGenerator(gen, upstream, recordStreamUsage, {
+    pingFrame: anthropicPingFrame,
+    pingIntervalMs: 15_000,
+  });
 }
 
 /** POST /v1/messages/count_tokens → Gemini :countTokens（v1.6.0：接入 single-flight + LRU + TTL 缓存） */

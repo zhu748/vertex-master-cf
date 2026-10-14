@@ -4,7 +4,17 @@
 > **Cloudflare Workers（official 模式免费计划即可；anon + 代理池建议 Workers Standard）**。在 cf-vproxy
 > （同作者的 official 模式 Workers 精简版）基础上，**补齐了 anon 匿名端点模式**，并把出站代理层按其
 > 设计重写（`cloudflare:sockets` 隧道 + 纯 JS TLS 1.3 + 连接复用池 + 订阅拉取 + 对冲竞速）。
-> 当前版本 **v1.2.0**（补齐 Go 版全部业务端点与 safety_settings 语义 + Workers 平台专项调优）。
+> 当前版本 **v1.3.0**（第二轮逐行比对：Anthropic 协议级 ping 保活 + Workers 专项优化）。
+>
+> v1.3.0 变更（相对 v1.2.0）：
+>
+> | 改动 | 说明 |
+> |------|------|
+> | **Anthropic 协议级 ping** | 流式连接每 15s 发送 `event: ping`（对齐 Go 版 `emitPing`）；Claude Code SDK 靠它判断连接存活，长思考场景不再被误判超时断连。其他协议仍用 SSE 注释帧 |
+> | **thinking budget 对齐** | `HIGH` 档在全部 2.5 系统一映射为 24576（对齐 Go `budgetForThinkingLevel`；旧版 pro 误为 32768） |
+> | **示例密钥拒绝** | 照抄示例的 `sk-your-key-here` 直接 401（对齐 Go 版 `withAPIKey`） |
+> | **闸门范围收窄** | 并发闸门仅作用于出站端点（对齐 Go `isUpstreamWorkloadPath`）：满载流式请求时 `GET /v1/models` 等列表端点仍可用，SDK 启动不再报错 |
+> | **Images 并行生成** | `n>1` 时滑动窗口并发（默认 3）：n=8 延迟从串行 8 倍降至 ⌈8/3⌉ 倍；结果保序、任一失败即返回首个错误（语义同 Go 串行 fail-fast） |
 
 **两种上游通道（原项目 `gemini_api_mode` 语义，面板一键切换）：**
 
@@ -147,9 +157,10 @@ vertex-master-cf/
 ├── wrangler.jsonc            # Worker 配置（KV / Smart Placement / Cron）
 ├── src/
 │   ├── index.ts              # 入口（fetch + scheduled）+ 服务信息
-│   ├── router.ts / gate.ts   # 业务路由表 / 并发与体积闸门
+│   ├── router.ts / gate.ts   # 业务路由表 / 并发与体积闸门（仅出站端点占名额）
 │   ├── config.ts / types.ts  # KV 配置（含 apimode）+ 类型
 │   ├── upstream.ts           # 上游胶水层：callGemini 按 apimode 分流
+│   ├── bounded.ts            # 有界并发原语（Images n 张并行生成）
 │   ├── anon/                 # ★ anon 匿名端点（本次移植核心）
 │   │   ├── payload.ts        #   batchGraphql 壳 + Chrome 头 + x-browser-validation
 │   │   ├── recaptcha.ts      #   anchor/reload token 现抓（经代理或直连）
@@ -167,7 +178,7 @@ vertex-master-cf/
 │   ├── convert/              # OpenAI/Anthropic ⇄ Gemini 转换
 │   ├── handlers/             # 各协议端点 + admin + panel（含模式切换 UI）
 │   └── racing.ts / cron.ts / usage.ts / metrics.ts / logs.ts / ...
-└── test/                     # node --test 单测（90 例，纯逻辑全量回归）
+└── test/                     # node --test 单测（107 例，纯逻辑全量回归）
 ```
 
 ## 🧪 开发与验证
@@ -185,7 +196,7 @@ npm run deploy      # 部署
 
 | 平台约束 | 数值（免费 / 付费） | 本项目的应对 |
 |----------|--------------------|--------------|
-| 每请求子请求预算 | 50 / 1000 | 模型表、配置、订阅缓存均走 isolate 内存缓存（30–60s TTL），热路径零 KV 读；anon 接力上限 3 候选 × 4 尝试，控制在预算内；巡检 batch_size ≤ 40 |
+| 每请求子请求预算 | 50 / 1000 | 模型表、配置、订阅缓存均走 isolate 内存缓存（30–60s TTL），热路径零 KV 读；anon 接力上限 3 候选 × 4 尝试，控制在预算内；巡检 batch_size ≤ 40；Images n 张并发窗口 3（n=8 仅 8 个子请求，远低于限额） |
 | 每请求 CPU 时间 | 10ms / 30s | official 模式（fetch 直连）免费计划即可；anon 模式走代理需纯 JS TLS 1.3 握手（密码学运算经 WebCrypto 原生加速），**建议 Workers Standard 付费计划** |
 | isolate 内存 | 128MB | 并发闸门名额在读 body 前获取，在飞大体积缓冲受 max_concurrent_requests 约束；recaptcha/上游响应 4MiB 上限整读 |
 | KV 写入额度 | 1000 次/天 | 用量/指标/健康度全部「内存累积 + 25s 批量合并刷盘」，常量级写入 |
@@ -198,6 +209,8 @@ npm run deploy      # 部署
 ## ⚠️ 与原项目（Go 版）的差异
 
 **v1.2.0 已逐行比对 Go 版路由表与配置结构补齐**：`/health`、`/keepalive`、`/api/hello`（Claude Code 网关探测）、`/favicon.ico`、`GET /v1beta/models/{model}`（Gemini 格式模型详情）、`safety_settings` 配置与 safetySettings 归一化（每个 anon 出站请求恒携带 5 类阈值，语义同 Go 版 `BuildVertexVariables`）。
+
+**v1.3.0 第二轮比对再补齐**：Anthropic 流式协议级 `event: ping`（Go `emitPing`，15s）、`levelToBudget` HIGH → 24576（Go `budgetForThinkingLevel`）、示例密钥 `sk-your-key-here` 拒绝（Go `withAPIKey`）、并发闸门豁免模型列表端点（Go `isUpstreamWorkloadPath`）、Images n 张有界并发生成（超出 Go 串行行为的 Workers 优化）。
 
 剩余差异（平台本质限制或面板 UX 取舍，不影响核心代理功能）：
 

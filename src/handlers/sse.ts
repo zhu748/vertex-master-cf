@@ -11,6 +11,18 @@ import { ssePingFrame } from "../fakestream.ts";
 
 const PING_INTERVAL_MS = 10_000;
 
+export interface SseStreamOptions {
+  /**
+   * v1.3.0：协议感知的保活帧（对齐 Go 版 anthropic_handler.go emitPing）。
+   * 默认 SSE 注释帧 ": ping"（合规客户端静默丢弃，但足以重置中间代理空闲计时器）；
+   * Anthropic 端点传 anthropicPingFrame —— Claude Code SDK 期望协议级 ping 事件，
+   * 长思考场景下 Gemini 可能 10-30s 不发内容，没有 ping 会导致 SDK 误判超时断连。
+   */
+  pingFrame?: () => string;
+  /** v1.3.0：保活间隔（毫秒），默认 10s；Anthropic 语义对齐 Go 版 15s 亦可调 */
+  pingIntervalMs?: number;
+}
+
 // v2.4：共享编码器（旧版每流 new 一个；ping/数据帧编码无状态可安全复用）
 const TE = new TextEncoder();
 
@@ -33,7 +45,10 @@ export function sseResponseFromGenerator(
   gen: AsyncGenerator<string>,
   upstream?: Response | null,
   onDone?: () => void,
+  opts: SseStreamOptions = {},
 ): Response {
+  const pingInterval = opts.pingIntervalMs && opts.pingIntervalMs > 0 ? opts.pingIntervalMs : PING_INTERVAL_MS;
+  const nextPingFrame = opts.pingFrame ?? ssePingFrame;
   const stream = new ReadableStream<Uint8Array>({
     async pull(controller) {
       const pending = gen.next();
@@ -44,7 +59,7 @@ export function sseResponseFromGenerator(
       let timer: ReturnType<typeof setTimeout> | undefined;
       const armPing = () =>
         new Promise<"ping">((res) => {
-          timer = setTimeout(() => res("ping"), PING_INTERVAL_MS);
+          timer = setTimeout(() => res("ping"), pingInterval);
         });
       const clearTimer = () => {
         if (timer !== undefined) {
@@ -60,7 +75,7 @@ export function sseResponseFromGenerator(
             ping,
           ]);
           if (winner === "ping") {
-            controller.enqueue(TE.encode(ssePingFrame()));
+            controller.enqueue(TE.encode(nextPingFrame()));
             ping = armPing(); // 重置计时器，继续等待同一个 next() promise
             continue;
           }

@@ -47,9 +47,19 @@ export function splitFakeChunks(text: string, maxChunks = FAKE_STREAM_TARGET_CHU
   return out;
 }
 
-/** SSE 保活注释帧 */
+/** SSE 保活注释帧（重置中间代理/浏览器空闲计时器；合规 SSE 客户端静默丢弃） */
 export function ssePingFrame(): string {
   return ": ping\n\n";
+}
+
+/**
+ * Anthropic 协议级 ping 事件（移植 Go 版 anthropic_handler.go emitPing）。
+ * Claude Code SDK 期望流式连接中周期性收到 ping 事件保活：长思考场景下 Gemini
+ * 可能 10-30 秒不发内容，缺少 ping 会导致 SDK 误判超时断连。 Anthropic 官方
+ * SDK 对 ping 事件静默忽略，不影响其他客户端。
+ */
+export function anthropicPingFrame(): string {
+  return "event: ping\ndata: {}\n\n";
 }
 
 // ===== Gemini 原生端点假流式（移植自 gemini_handler.go geminiFakeStreamFrames）=====

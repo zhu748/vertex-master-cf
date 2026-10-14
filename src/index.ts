@@ -57,7 +57,13 @@ import { withFakeVariants } from "./fakestream.ts";
 //     网关探测）、GET /favicon.ico —— 均为鉴权豁免（对齐 Go 版 withAPIKey excluded 表）；
 //   - GET /v1beta/models/{model}（Gemini 格式模型详情，原项目 handleModelInfo）；
 //   - safety_settings 配置 + normalizeSafetySettings 归一化（Go 版 BuildVertexVariables 语义）。
-const VERSION = "1.2.0";
+// v1.3.0 —— 第二轮逐行比对 Go 版后的补齐与 Workers 优化：
+//   - Anthropic 流式改发协议级 event: ping（15s，对齐 Go emitPing，Claude Code SDK 依赖）；
+//   - levelToBudget HIGH 统一 24576（对齐 Go budgetForThinkingLevel，原 pro 误为 32768）；
+//   - 拒绝示例密钥 sk-your-key-here（对齐 Go withAPIKey）；
+//   - 并发闸门仅作用于出站端点（对齐 Go isUpstreamWorkloadPath：模型列表/详情不占名额）；
+//   - Images n 张有界并发生成（滑动窗口 concurrency=3，n=8 延迟从 8x 降至 ⌈8/3⌉x）。
+const VERSION = "1.3.0";
 
 function corsHeaders(): Record<string, string> {
   return {
@@ -96,16 +102,18 @@ function serviceInfo(): Response {
       "上游双通道：anon 匿名 batchGraphql 端点（免 Key，reCAPTCHA 现抓）/ official 官方单 Key 直连",
       "openai/anthropic/gemini 三协议转换 + OpenAI Responses/TTS/Images 端点",
       "假流式：fake-/假流式- 前缀全端点生效 + aggregate_stream（原项目 fakestream 移植）",
+      "Anthropic 流式协议级 event: ping 保活（15s，Claude Code SDK 依赖）",
       "socks4/4a/socks5/http 出站代理（cloudflare:sockets 隧道 + 纯 JS TLS 1.3）",
       "对冲竞速（原项目 race engine 移植）+ 429 单 IP 窗口轮转 / 每日配额硬失败分类",
       "节点健康度 + 粘性优选 + 节点内重试 + 直连模式退避重试 + 全池熔断兜底",
       "Cron 定时健康巡检 / 订阅差异更新 / keepalive 保活",
       "OpenAI n 多候选（max_n，原项目 CompleteChatN 移植）",
+      "Images n 张有界并发生成（滑动窗口 concurrency=3，结果保序）",
       "official 模式上游镜像/中转基地址（gemini_base_url）",
       "请求指标（JSON / Prometheus）+ Claude 提示词诊断",
       "订阅拉取 + 不支持协议自动剔除（KV 缓存，上限 1000 节点）",
       "官方 ListModels 拉取模型表（内置 + 面板一键重新拉取）",
-      "KV 配置热更新 + max_concurrent_requests/max_request_mb 闸门",
+      "KV 配置热更新 + max_concurrent_requests/max_request_mb 闸门（仅出站端点占名额）",
       "count_tokens 缓存（single-flight + LRU + TTL；anon 模式走匿名 CountTokens 操作）",
       "Gemini 原生响应规范化（占位符清理/空流错误帧/补 STOP 帧）",
       "用量/请求日志持久化",
@@ -254,6 +262,10 @@ async function route(req: Request, env: Env, ctx: ExecutionContext): Promise<Res
   if (!clientKey || !cfg.api_keys.some((k) => tokensEqual(k, clientKey))) {
     return protocolErrorResponse(proto, 401, "Invalid API key");
   }
+  // v1.3.0：拒绝示例密钥（对齐 Go 版 withAPIKey —— 防止用户照抄示例配置后裸奍上线）
+  if (clientKey === "sk-your-key-here") {
+    return protocolErrorResponse(proto, 401, "示例密钥禁止调用，请新建密钥。");
+  }
 
   // ===== 路由匹配（纯路由表见 src/router.ts）=====
   const routeInfo: ApiRoute = matchApiRoute(req.method, path);
@@ -272,7 +284,11 @@ async function route(req: Request, env: Env, ctx: ExecutionContext): Promise<Res
   }
 
   // ===== 闸门 2：全局并发门（max_concurrent_requests，超出 503 + Retry-After）=====
-  const slot = acquireSlot(cfg.max_concurrent_requests);
+  // v1.3.0：对齐 Go 版 isUpstreamWorkloadPath —— 仅出站（需上游/代理池）的端点占并发名额；
+  // 模型列表/详情（GET /v1/models、/v1beta/models、单模型查询）不读 body、不出站，
+  // 不应消耗名额：否则满载流式请求时客户端连模型列表都拿不到（SDK 启动即报错）。
+  const needsGate = NEEDS_UPSTREAM.has(routeInfo.kind);
+  const slot = needsGate ? acquireSlot(cfg.max_concurrent_requests) : { acquired: true, release: () => {} };
   if (!slot.acquired) {
     // v1.8.0：繁忙响应按协议家族返回（旧实现固定 OpenAI 形态，Anthropic/Gemini 客户端解析不到对应字段）
     return protocolErrorResponse(

@@ -3,11 +3,12 @@
 //   POST /v1/images/edits         multipart（image 多文件、mask、prompt、negative_prompt、n…）
 //   POST /v1/images/variations    同 edits，无 mask
 // 出站统一走 Gemini 图像模型 generateContent（responseModalities=TEXT+IMAGE），
-// 默认模型 gemini-3.1-flash-image；n>1 循环请求凑满（Gemini 无服务端 n）。
+// 默认模型 gemini-3.1-flash-image；n>1 有界并发生成（Gemini 无服务端 n，v1.3.0 前为串行）。
 import { bytesToBase64, errOpenAI, json, partInlineData, partText } from "../convert/common.ts";
 import type { GPart, GResponse } from "../types.ts";
 import { callGemini, mapUpstreamError, resolveModel, type HandlerCtx } from "../upstream.ts";
 import { recordUsage, scheduleFlush } from "../usage.ts";
+import { runBounded } from "../bounded.ts";
 
 export const DEFAULT_IMAGE_MODEL = "gemini-3.1-flash-image";
 export const MAX_IMAGE_N = 8;
@@ -160,6 +161,32 @@ async function callImageOnce(
   return { image: images[0] };
 }
 
+/**
+ * v1.3.0：n 张图有界并发生成（Workers 优化项，核心原语见 src/bounded.ts runBounded）。
+ *   - Go 版串行循环 n 次上游请求，n=8 时延迟叠加 8 倍；这里用滑动窗口并发（默认 3），
+ *     延迟降至 ⌈n/3⌉ 倍，同时控制子请求在飞数量（免费计划单请求 50 子请求限额内绰绰有余）；
+ *   - 语义对齐 Go 版 fail-fast：任一请求失败即返回首个错误；全部成功则按请求顺序
+ *     返回 n 张（并发下仍保持序号稳定，便于客户端对应）。
+ */
+export const IMAGE_GEN_CONCURRENCY = 3;
+
+export async function generateImagesBounded(
+  ctx: HandlerCtx,
+  model: string,
+  payload: Record<string, unknown>,
+  n: number,
+  concurrency = IMAGE_GEN_CONCURRENCY,
+): Promise<{ images?: Array<{ mime_type: string; data: string }>; error?: Response }> {
+  try {
+    const results = await runBounded(n, concurrency, () => callImageOnce(ctx, model, payload));
+    return { images: results.map((r) => r.image!) };
+  } catch (e) {
+    // callImageOnce 不抛异常、错误以 Response 载体返回 —— 这里收到的必然是首个错误 Response
+    if (e instanceof Response) return { error: e };
+    throw e;
+  }
+}
+
 function imagesToResponse(images: Array<{ mime_type: string; data: string }>, responseFormat: string): Response {
   return json({
     created: Math.floor(Date.now() / 1000),
@@ -192,11 +219,9 @@ export async function handleImagesGenerations(req: Request, ctx: HandlerCtx): Pr
     size: body.size,
   });
   const images: Array<{ mime_type: string; data: string }> = [];
-  for (let i = 0; i < n; i++) {
-    const r = await callImageOnce(ctx, resolved.model, payload);
-    if (r.error) return r.error;
-    if (r.image) images.push(r.image);
-  }
+  const gen = await generateImagesBounded(ctx, resolved.model, payload, n);
+  if (gen.error) return gen.error;
+  images.push(...(gen.images ?? []));
   ctx.waitUntil(scheduleFlush(ctx.env));
   return imagesToResponse(images, responseFormat);
 }
@@ -260,11 +285,9 @@ export async function handleImagesEdits(req: Request, ctx: HandlerCtx, variation
     background,
   });
   const out: Array<{ mime_type: string; data: string }> = [];
-  for (let i = 0; i < n; i++) {
-    const r = await callImageOnce(ctx, resolved.model, payload);
-    if (r.error) return r.error;
-    if (r.image) out.push(r.image);
-  }
+  const gen = await generateImagesBounded(ctx, resolved.model, payload, n);
+  if (gen.error) return gen.error;
+  out.push(...(gen.images ?? []));
   ctx.waitUntil(scheduleFlush(ctx.env));
   return imagesToResponse(out, responseFormat);
 }

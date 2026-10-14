@@ -102,7 +102,7 @@ function clamp(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
 }
 
-/** Level → 2.5 系 budget（原项目映射表） */
+/** Level → 2.5 系 budget（原项目映射表；v1.3.0：HIGH 统一 24576，对齐 Go budgetForThinkingLevel default 分支） */
 export function levelToBudget(level: ThinkingLevel, kind: "budget-pro" | "budget-flash" | "budget-flash-lite"): number {
   switch (level) {
     case "NONE":
@@ -113,7 +113,7 @@ export function levelToBudget(level: ThinkingLevel, kind: "budget-pro" | "budget
     case "MEDIUM":
       return 8192;
     case "HIGH":
-      return kind === "budget-pro" ? 32768 : 24576;
+      return 24576;
   }
 }
 
