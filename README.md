@@ -4,9 +4,17 @@
 > **Cloudflare Workers（official 模式免费计划即可；anon + 代理池建议 Workers Standard）**。在 cf-vproxy
 > （同作者的 official 模式 Workers 精简版）基础上，**补齐了 anon 匿名端点模式**，并把出站代理层按其
 > 设计重写（`cloudflare:sockets` 隧道 + 纯 JS TLS 1.3 + 连接复用池 + 订阅拉取 + 对冲竞速）。
-> 当前版本 **v1.5.0**（anon 无头链路根因修复：verify-fail 首帧预期同 token 重试 +
-> in-band 429 识别与整轮换点重试 —— 实测确认无头链路本身完好，此前失败仅为
-> 429 限流未被正确分类处理）。
+> 当前版本 **v1.5.2**（**重大根因修复**：代理隧道 TLS 应用数据接线 ——
+> 此前 TLS 握手后向裸隧道写明文 HTTP，服务端必然断连，Workers 代理路径 100% 失败）。
+>
+> v1.5.2 变更（相对 v1.5.1）：
+>
+> | 改动 | 说明 |
+> |------|------|
+> | **TLS 应用数据接线（根因）** | `viaProxyCold`（竞速/official 路径）与 `requestViaCandidate`（anon 路径）在 `Tls13Client.handshake()` 完成后，此前的请求写入/响应读取直接操作**裸隧道** reader/writer —— 等于在已完成 TLS 握手的连接上发明文 HTTP/1.1，服务端必然断连（线上表现为 recaptcha/batchGraphql 全候选 `byteio: EOF while reading headers`，代理路径自移植以来 100% 失败；本地 Python `ssl` 模块验证正常，故长期未发现）。byteio.ts v2.0 注释声明的「注入 tls13 客户端字节源」设计从未接上。现握手后改用 `tls.write()`/`tls.read()` 加解密通道（`ByteBufReader` 包 TLS 字节源 + 写适配器），warm 连接复用语义不变。离线集成测试（本地 TLS 1.3 服务器）4 场景验证：明文写入被拒（复现根因）/ 加密通道 200 / warm 双请求复用 / 多记录大响应体 |
+> | recaptcha 失败记健康 | token 抓取失败（隧道死/被墙）现记 `recordProxyFailure` —— 死节点凭陈旧高分霸占候选头部的问题根治；同时消除循环内重复重抓（旧版单候选最多 12 次隧道尝试，失败路径 80s+ 超时） |
+>
+> v1.5.1 变更（相对 v1.5.0）：recaptcha token 抓取失败记节点健康失败 + 消除循环内重复重抓。
 >
 > v1.5.0 变更（相对 v1.4.2）：
 >

@@ -242,12 +242,24 @@ async function viaProxyCold(
       throw err;
     }
     const now = Date.now();
+    // v1.5.2 根因修复：应用数据必须经 Tls13Client 加解密。旧版 conn.reader/writer
+    // 直连裸隧道 —— TLS 握手后发的是明文 HTTP/1.1，服务端必然断连
+    // （"byteio: EOF while reading headers"，Workers 代理路径 100% 失败）。
+    // byteio.ts v2.0 的结构性 ByteSource 接口本就是为注入 TLS 字节源而设计，
+    // 此前从未接上。warm 复用语义不变：连接池继续持有同一 conn。
+    const tlsReader = new ByteBufReader({
+      read: async () => {
+        const chunk = await tls.read();
+        return chunk ? { value: chunk, done: false } : { done: true };
+      },
+    });
+    const tlsWriter = { write: (b: Uint8Array) => tls.write(b) };
     const conn: TunnelConn = {
       proxyRaw: p.raw,
       target,
       tls,
-      reader: tunnel.reader,
-      writer: tunnel.writer,
+      reader: tlsReader,
+      writer: tlsWriter,
       created: now,
       lastUsed: now,
       uses: 0,

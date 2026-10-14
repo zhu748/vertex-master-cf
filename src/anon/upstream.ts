@@ -97,6 +97,19 @@ async function requestViaCandidate(
       throw err;
     }
 
+    // v1.5.2 根因修复：TLS 握手完成后的应用数据必须经 tls.write()/tls.read()
+    // 加解密。旧版直接把请求写进裸隧道、从裸隧道读响应 —— 等于在已完成 TLS
+    // 握手的连接上发明文 HTTP/1.1，服务端必然断连（"byteio: EOF while reading
+    // headers"，Workers 上代理路径 100% 失败；本地 Python ssl 模块验证正常故
+    // 一直未发现 —— byteio.ts v2.0 注释的「注入 tls13 客户端字节源」从未接上）。
+    const tlsReader = new ByteBufReader({
+      read: async () => {
+        const chunk = await tls.read();
+        return chunk ? { value: chunk, done: false } : { done: true };
+      },
+    });
+    const tlsWriter = { write: (b: Uint8Array) => tls.write(b) };
+
     const bodyBytes = body ? new TextEncoder().encode(body) : new Uint8Array(0);
     const lines: string[] = [method + " " + u.pathname + u.search + " HTTP/1.1", "Host: " + u.host];
     for (const [k, v] of Object.entries(headers)) {
@@ -109,10 +122,10 @@ async function requestViaCandidate(
     const out = new Uint8Array(head.length + bodyBytes.length);
     out.set(head, 0);
     out.set(bodyBytes, head.length);
-    await withTimeout(writer.write(out), ANON_CONNECT_TIMEOUT_MS, "anon write request timeout");
+    await withTimeout(tlsWriter.write(out), ANON_CONNECT_TIMEOUT_MS, "anon write request timeout");
 
     const headBlock = await withTimeout(
-      reader.readHeaderBlock(),
+      tlsReader.readHeaderBlock(),
       ANON_RESPONSE_HEAD_TIMEOUT_MS,
       "anon: no response head within " + ANON_RESPONSE_HEAD_TIMEOUT_MS / 1000 + "s (dead tunnel?)",
     );
@@ -127,7 +140,7 @@ async function requestViaCandidate(
     }
     if (shape.chunked || shape.contentLength !== null) {
       // 流式体：ReadableStream 透传（调用方整读或扫描）
-      const bodyStream = makeBodyStream(reader, shape, () => {
+      const bodyStream = makeBodyStream(tlsReader, shape, () => {
         try {
           tls.close();
         } catch {
@@ -136,7 +149,7 @@ async function requestViaCandidate(
       });
       return new Response(bodyStream, { status: rh.status, statusText: rh.reason, headers: outHeaders });
     }
-    const full = await readFullBody(reader, shape);
+    const full = await readFullBody(tlsReader, shape);
     tls.close();
     return new Response(full, { status: rh.status, statusText: rh.reason, headers: outHeaders });
   } catch (err) {
