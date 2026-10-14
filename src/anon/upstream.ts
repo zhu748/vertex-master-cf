@@ -16,13 +16,13 @@ import type { VProxyConfig } from "../types.ts";
 import type { HandlerCtx } from "../upstream.ts";
 import { errGemini, json } from "../convert/common.ts";
 import type { ProxyEntry, ProxyPool } from "../egress/pool.ts";
-import { orderedCandidates, poolRoundWaitMs } from "../egress/racefetch.ts";
+import { poolRoundWaitMs } from "../egress/racefetch.ts";
 import { closeQuietly, sleep, tcpConnect, withTimeout } from "../egress/sockets.ts";
 import { ByteBufReader } from "../egress/byteio.ts";
 import { proxyHandshake } from "../egress/handshake.ts";
 import { applyContentDecoding, decodeFullBodyBytes, determineBodyShape, isBodylessStatus, makeBodyStream, parseResponseHeadBlock, readFullBody } from "../egress/httpio.ts";
 import { Tls13Client, invalidateSessionTicket } from "../egress/tls13.ts";
-import { classify429Body, ensureHealthLoaded, recordProxyFailure, recordProxyRateLimit, recordProxySuccess } from "../racing.ts";
+import { anonPvpCandidateOrder, anonRoundCount, anonRoundDeadlineMs, classify429Body, ensureHealthLoaded, healthMapSnapshot, recordProxyFailure, recordProxyRateLimit, recordProxySuccess } from "../racing.ts";
 import { fetchRecaptchaToken } from "./recaptcha.ts";
 import {
   anonHeaders,
@@ -41,12 +41,15 @@ import {
   scanJsonObjects,
 } from "./streamparse.ts";
 
-const ANON_MAX_CANDIDATES = 3; // 单轮最多接力候选数（Workers 子请求预算内）
+const ANON_MAX_CANDIDATES = 3; // 单轮最多并行候选数（Workers 同时连接上限 6：
+// 3 活跃 GraphQL 隧道 + ≤3 条池内 keep-alive 空闲 recaptcha 隧道 ≈ 6，再加宽会撞限）
 const ANON_MAX_ATTEMPTS = 4; // 单候选内最大尝试（首验重试 + 换 token 重试）
-/** v1.5.0：跨轮候选调用预算（token 抓取 + 多次 batchGraphql 均耗子请求）。
- *  每次候选调用约 3~5 个 socket（1 recaptcha 隧道 + ≤4 batchGraphql 隧道），
- *  预算 6 次 ≈ 30 子请求，加上 KV 读写仍在免费版 50 限额内。 */
-const ANON_CANDIDATE_BUDGET = 6;
+/** v1.6.0：跨轮候选调用预算（token 抓取 + 多次 batchGraphql 均耗子请求）。
+ *  每次候选调用约 2~5 个 socket（1~2 recaptcha 隧道 + ≤4 batchGraphql 隧道），
+ *  预算 12 次 ≈ 24~36 子请求，加上 KV 读写仍在免费版 50 限额内。
+ *  PVP 语义（用户线上实测确认）：匿名端点 429 是 per-IP 窗口抢占而非每日配额
+ *  —— 窗口秒级释放，多打几发换 IP 轮转即可抢到，弹药翻倍直接提升胜率。 */
+const ANON_CANDIDATE_BUDGET = 12;
 /** v1.5.4：单候选「产出内容前」阶段截止 —— 坏节点 token 抓取内部 3 次尝试
  *  各自可停滞至 recaptcha body 超时，不加限制时整轮被最慢者拖到 45s+。
  *  任一候选产出内容即全部解除（胜者的长生成不受限制）。 */
@@ -374,14 +377,13 @@ async function runChatCandidate(
 
 // ---------- 对外入口 ----------
 
-/** v1.5.0：anon 整轮 429 重试轮数（对齐 racefetch v1.4.0 语义，复用
- *  racing.rate_limit_retries 配置）。钳在 1~3 轮：每轮重新选候选（被 429
- *  冷却的节点自然沉底 → 天然换 IP），配合 ANON_CANDIDATE_BUDGET 保证
- *  Workers 免费版 50 子请求限额内。 */
+/** v1.5.0 / v1.6.0：anon 整轮 429 重试轮数 —— 复用 racing.rate_limit_retries
+ *  配置，纯逻辑在 racing.ts anonRoundCount（钳 1~4 轮，Node 可单测）：每轮
+ *  重新选候选（被 429 冷却的节点自然沉底 → 天然换 IP），配合
+ *  ANON_CANDIDATE_BUDGET=12（4 轮 × 3 并发）保证 Workers 免费版 50 子请求
+ *  限额内。PVP 场景下窗口秒级释放：多轮换 IP 轮转 = 更多抢占机会。 */
 function anonMaxRounds(cfg: VProxyConfig): number {
-  const r = cfg.racing?.rate_limit_retries;
-  const n = typeof r === "number" && Number.isFinite(r) ? Math.trunc(r) : 1;
-  return 1 + Math.min(Math.max(n, 0), 2);
+  return anonRoundCount(cfg.racing?.rate_limit_retries);
 }
 
 /** v1.5.0：429 换轮等待 —— 池内有活节点立即换点（0ms）；全池冷却则等到
@@ -395,9 +397,10 @@ async function anonRoundWait(pool: ProxyPool | null): Promise<void> {
   if (wait > 0) await sleep(wait + Math.random() * 250); // 抖动错峰并发重试蜂拥
 }
 
-/** 候选列表：代理池健康排序（无池 → 直连兜底） */
+/** 候选列表（v1.6.2：anon PVP 专用排序 —— 活节点（含 429 冷却中）永远
+ *  排在未测试之前；无池 → 直连兜底）。 */
 function anonCandidates(pool: ProxyPool | null): Array<ProxyEntry | null> {
-  if (pool && pool.size > 0) return orderedCandidates(pool, ANON_MAX_CANDIDATES);
+  if (pool && pool.size > 0) return anonPvpCandidateOrder(pool.entries, healthMapSnapshot(), Date.now(), ANON_MAX_CANDIDATES);
   return [null];
 }
 
@@ -408,16 +411,22 @@ interface ChatRaceResult {
   last429: AnonUpstreamError | null;
 }
 
+/** v1.6.0：整场竞速墙钟上限（内容前阶段的总帽子）——4 轮 × 22s 单轮截止
+ *  叠加最坏 ~88s，会逼近 CF 代理 ~100s 首字节超时；总上限硬性钳制 60s，
+ *  到点后不再开新轮，在飞轮的最迟截止 = 剩余预算（≥3s）。产出内容后解除
+ *  （长生成不受限，与单轮截止同语义）。 */
+const ANON_TOTAL_RACE_DEADLINE_MS = 60_000;
+
 /**
- * v1.5.4：chat 候选并发竞速（Generate/Stream 共用骨架）。
+ * v1.5.4 / v1.6.0：chat 候选并发竞速（Generate/Stream 共用骨架）。
  * 每轮最多 ANON_MAX_CANDIDATES 个候选**并行**执行（各自独立隧道 + token，
- * 互不干扰；Workers 同时连接数上限 6，3 候选 × 1 隧道安全）：
+ * 互不干扰；Workers 同时连接数上限 6：3 活跃隧道 + ≤3 池内空闲隧道安全）：
  *   - 首个产出内容的候选成为 owner，其 chunk 经 emit 流出；其余候选立即中止；
- *   - 全部 relay 且撞过 429 → 等待换轮重选候选（冷却让位 → 换 IP）再战；
- *   - 跨轮预算 ANON_CANDIDATE_BUDGET 总控。
- * 取代 v1.5.0 的顺序接力：全池限流场景下 429 返回时延从 ~48s 降至 ~15s，
- * 成功场景下首个响应即用（不再被前排慢节点拖住）。
- */
+ *   - 全部 relay 且撞过 429 → 池内有活节点 0ms 换点重选（冷却让位 → 换 IP）再战；
+ *   - 跨轮预算 ANON_CANDIDATE_BUDGET 总控（v1.6.0：12 = 4 轮 × 3 并发）。
+ * PVP 语义（v1.6.0，用户线上实测确认）：匿名端点 429 是 per-IP 窗口抢占而非
+ * 每日配额 —— 窗口秒级释放、换 IP 多打几发即可抢到；弹药 6 → 12 直接提升
+ * 抢占胜率，全部耗尽仍以 429 语义透传（客户端亦可自带重试）。 */
 async function raceChatCandidates(
   ctx: HandlerCtx,
   params: ChatParams,
@@ -425,22 +434,30 @@ async function raceChatCandidates(
   signal?: AbortSignal,
 ): Promise<ChatRaceResult> {
   const maxRounds = anonMaxRounds(ctx.cfg);
+  const raceStart = Date.now();
   let budget = ANON_CANDIDATE_BUDGET;
   let lastTerminal: AnonUpstreamError | null = null;
   let last429: AnonUpstreamError | null = null;
 
   for (let round = 0; round < maxRounds && budget > 0; round++) {
-    if (round > 0) await anonRoundWait(ctx.pool);
+    // v1.6.0：整场墙钟到点 → 不再开新轮（在飞轮按剩余预算自行截止）
+    if (round > 0) {
+      if (Date.now() - raceStart >= ANON_TOTAL_RACE_DEADLINE_MS) break;
+      await anonRoundWait(ctx.pool);
+    }
     const pool = anonCandidates(ctx.pool);
     const cands = pool.filter(() => budget-- > 0);
     if (cands.length === 0) break;
 
     // 每候选独立 AbortController：owner 产生即中止其余候选（父 signal 中止全部）；
-    // v1.5.4：内容前阶段截止计时器（任一候选产出内容即全部解除）
+    // v1.5.4：内容前阶段截止计时器（任一候选产出内容即全部解除）；
+    // v1.6.0：单轮截止钳入整场剩余预算（总墙钟 60s 硬限，≥3s 保底）
+    const remaining = ANON_TOTAL_RACE_DEADLINE_MS - (Date.now() - raceStart);
+    const roundDeadlineMs = anonRoundDeadlineMs(remaining, ANON_CANDIDATE_PRE_CONTENT_DEADLINE_MS);
     const aborts = cands.map(() => new AbortController());
     const deadlines: Array<ReturnType<typeof setTimeout>> = [];
     aborts.forEach((a) => {
-      deadlines.push(setTimeout(() => a.abort(), ANON_CANDIDATE_PRE_CONTENT_DEADLINE_MS));
+      deadlines.push(setTimeout(() => a.abort(), roundDeadlineMs));
     });
     const clearDeadlines = () => {
       for (const t of deadlines) clearTimeout(t);

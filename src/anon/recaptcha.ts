@@ -12,19 +12,22 @@
 //   - 每次最多 3 次尝试（对齐 Go 版语义）；失败返回 null（调用方按「空则重试/换路」处理）。
 import {
   anchorHeaders,
+  anchorProbeUrl,
   ensureBrowserValidation,
   randomString,
+  RECAPTCHA_BASE,
+  RECAPTCHA_CO,
+  RECAPTCHA_HL,
+  RECAPTCHA_SITE_KEY,
+  RECAPTCHA_V,
   xhrHeaders,
 } from "./payload.ts";
 import type { ProxyEntry } from "../egress/pool.ts";
 import { viaProxy } from "../egress/racefetch.ts";
 
 // recaptcha 相关硬编码常量（逐字节保持既定常量，对齐 Go 版）。
-const RECAPTCHA_BASE = "https://www.google.com";
-const SITE_KEY = "6LdCjtspAAAAAMcV4TGdWLJqRTEk1TfpdLqEnKdj";
-const RECAPTCHA_CO = "aHR0cHM6Ly9jb25zb2xlLmNsb3VkLmdvb2dsZS5jb206NDQz";
-const RECAPTCHA_HL = "zh-CN";
-const RECAPTCHA_V = "jdMmXeCQEkPbnFDy9T04NbgJ";
+// v1.6.1：anchor 侧常量（BASE/SITE_KEY/CO/HL/V）移入 payload.ts（纯模块，
+// 巡检 probe.ts 与 Node 单测共用）；此处仅保留 reload 专用常量。
 const RECAPTCHA_VH = "6581054572";
 const RESPONSE_MAX_BYTES = 4 << 20;
 
@@ -99,11 +102,7 @@ async function postViaTransport(
 async function fetchOnce(transport: RecaptchaTransport, signal?: AbortSignal): Promise<string> {
   await ensureBrowserValidation();
   const cb = randomString(10);
-  const anchorURL =
-    RECAPTCHA_BASE +
-    "/recaptcha/enterprise/anchor?ar=1&k=" + SITE_KEY +
-    "&co=" + RECAPTCHA_CO + "&hl=" + RECAPTCHA_HL + "&v=" + RECAPTCHA_V +
-    "&size=invisible&anchor-ms=20000&execute-ms=15000&cb=" + cb;
+  const anchorURL = anchorProbeUrl(cb);
 
   const anchor = await getViaTransport(anchorURL, anchorHeaders(), transport, signal);
   if (anchor.status !== 200) throw new Error("recaptcha: anchor HTTP " + anchor.status);
@@ -117,7 +116,7 @@ async function fetchOnce(transport: RecaptchaTransport, signal?: AbortSignal): P
   const form = new URLSearchParams({
     v: RECAPTCHA_V,
     reason: "q",
-    k: SITE_KEY,
+    k: RECAPTCHA_SITE_KEY,
     c: baseToken,
     co: RECAPTCHA_CO,
     hl: RECAPTCHA_HL,
@@ -126,7 +125,7 @@ async function fetchOnce(transport: RecaptchaTransport, signal?: AbortSignal): P
     chr: "",
     bg: "",
   });
-  const reloadURL = RECAPTCHA_BASE + "/recaptcha/enterprise/reload?k=" + SITE_KEY;
+  const reloadURL = RECAPTCHA_BASE + "/recaptcha/enterprise/reload?k=" + RECAPTCHA_SITE_KEY;
   const reloadHeaders = xhrHeaders(
     "application/x-www-form-urlencoded;charset=UTF-8",
     "*/*",

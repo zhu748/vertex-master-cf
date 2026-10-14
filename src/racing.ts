@@ -341,6 +341,112 @@ export function rateLimitRoundWaitMs(cooldownUntilSecs: number[], nowMs: number)
   return Math.min(Math.max(earliest - nowMs, 250), RATE_LIMIT_ROUND_WAIT_MAX_MS);
 }
 
+// ---------- v1.6.0：anon PVP 竞速轮次/截止（纯函数，Node 可单测） ----------
+
+/**
+ * v1.6.0：anon 整轮 429 重试轮数（anon/upstream.ts 调用）。
+ * 复用 racing.rate_limit_retries 配置，钳在 1~4 轮：
+ *   - 默认（未配置）1 次重试 → 2 轮；
+ *   - PVP 推荐配置 rate_limit_retries=3 → 4 轮 × 3 并发 = 12 发候选。
+ * PVP 语义（用户线上实测确认）：匿名端点 429 是 per-IP 窗口抢占而非每日配额，
+ * 窗口秒级释放 —— 每轮重选候选（被 429 冷却的节点自然沉底 → 天然换 IP），
+ * 多轮换 IP 轮转即更多抢占机会。
+ */
+export function anonRoundCount(rateLimitRetries: number | undefined): number {
+  const n = typeof rateLimitRetries === "number" && Number.isFinite(rateLimitRetries) ? Math.trunc(rateLimitRetries) : 1;
+  return 1 + Math.min(Math.max(n, 0), 3);
+}
+
+/**
+ * v1.6.0：anon 单轮「产出内容前」截止 = min(单轮上限 22s, 整场剩余墙钟预算)，
+ * ≥3s 保底（剩余再少也至少给在飞轮 3s，而非立即全灭）。
+ * 整场墙钟 60s 硬限（ANON_TOTAL_RACE_DEADLINE_MS）：4 轮 × 22s 最坏 ~88s 会
+ * 逼近 CF 代理 ~100s 首字节超时；钳入剩余预算后内容前阶段总时长 ≤ 60s。
+ * 产出内容后截止解除（胜者的长生成不受限）。
+ */
+export function anonRoundDeadlineMs(remainingTotalMs: number, perRoundCapMs: number): number {
+  return Math.min(perRoundCapMs, Math.max(3_000, remainingTotalMs));
+}
+
+/**
+ * v1.6.1：巡检批量上限 —— anon 模式双主机探测每节点最多 2 子请求
+ * （anchor + batchGraphql 主机；阶段 1 失败短路后死节点只耗 1），钳 20
+ * 保免费计划单次调用 50 子请求限额（20×2 + KV 读写 ≈ 44）；official 模式
+ * 单探测维持 40。探测目标失真的教训见 anon/probe.ts 头注释。
+ */
+export function sweepBatchCap(apimode: string): number {
+  return apimode === "anon" ? 20 : 40;
+}
+
+// ---------- v1.6.2：anon PVP 候选排序（纯函数，Node 可单测） ----------
+
+/**
+ * v1.6.2：anon 模式专用候选排序 —— PVP 语义下「429 = 活着但在竞争」。
+ *
+ * 背景（线上实测）：通用 healthScore 的 429 计次降权（-5×count，v2.5.1 为
+ * official 375 节点池设计）把反复撞 429 的活节点压到未测试节点（80 分）
+ * 之下 —— 在 anon 现实（几百节点仅 ~5% 活着）下反效果：竞速宁可去撞
+ * 95% 死亡率的未测试节点（recaptcha 阶段即死，非 429 relay → 整轮 break
+ * → 客户端拿 502），也不复用已知活节点。429 本身就是节点与 Google 全链路
+ * 可用的证明，远比未测试节点有价值。
+ *
+ * 分层（anon 专用，不改动 official 路径的 selectCandidates）：
+ *   1. 已验证且未冷却 —— 按 healthScore 降序（429 计次只在层内微调次序）；
+ *   2. 已验证但冷却中（近 6h 内成功过，含 429 冷却/瞬时失败）—— 按最早恢复
+ *      排序：冷却只是排序概念而非连接阻断，PVP 下直接复打（每次 ~2-3 子请求，
+ *      窗口是否释放一试便知）；跨轮天然轮转（最早恢复者优先）；
+ *   3. 未测试探索档（发现新节点；cron 巡检为主、竞速兜底）；
+ *   4. 其余冷却（连败死节点）。
+ */
+export function anonPvpCandidateOrder<T extends CandidateLike>(
+  entries: T[],
+  healthMap: Map<string, ProxyHealth>,
+  now: number,
+  limit: number,
+): T[] {
+  const seen = new Set<string>();
+  const live: Array<{ e: T; score: number }> = [];
+  const coolingLive: Array<{ e: T; recoverAt: number }> = [];
+  const untested: T[] = [];
+  const rest: Array<{ e: T; recoverAt: number }> = [];
+  for (const e of entries) {
+    if (seen.has(e.raw)) continue;
+    seen.add(e.raw);
+    const h = healthMap.get(e.raw);
+    if (!h || (h.last_success_at === 0 && h.last_fail_at === 0)) {
+      untested.push(e);
+      continue;
+    }
+    if (isCooling(h, now)) {
+      const freshSuccess = h.last_success_at > 0 && now / 1000 - h.last_success_at < 6 * 3600;
+      (freshSuccess ? coolingLive : rest).push({ e, recoverAt: h.cooldown_until });
+      continue;
+    }
+    live.push({ e, score: healthScore(h, now) });
+  }
+  live.sort((a, b) => b.score - a.score);
+  coolingLive.sort((a, b) => a.recoverAt - b.recoverAt);
+  rest.sort((a, b) => a.recoverAt - b.recoverAt);
+  const out: T[] = [];
+  for (const v of live) {
+    if (out.length >= limit) break;
+    out.push(v.e);
+  }
+  for (const v of coolingLive) {
+    if (out.length >= limit) break;
+    out.push(v.e);
+  }
+  for (const u of untested) {
+    if (out.length >= limit) break;
+    out.push(u);
+  }
+  for (const v of rest) {
+    if (out.length >= limit) break;
+    out.push(v.e);
+  }
+  return out;
+}
+
 // ---------- v2.5.0：429 分类（纯函数，Node 可单测） ----------
 
 /**

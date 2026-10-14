@@ -23,6 +23,25 @@ export const COUNT_OPERATION_NAME = "CountTokens";
 export const COUNT_CLIENT_VERSION = "boq_cloud-boq-clientweb-vertexaistudio_20260402.09_p0";
 export const COUNT_PAGE_PATH = "/vertex-ai/studio/multimodal";
 
+// reCAPTCHA anchor/reload 常量（v1.6.1 从 recaptcha.ts 移入 —— 纯常量拼接，
+// 巡检探测 probe.ts 与 token 抓取共用，且 Node 可单测）。逐字节对齐 Go 版。
+export const RECAPTCHA_BASE = "https://www.google.com";
+export const RECAPTCHA_SITE_KEY = "6LdCjtspAAAAAMcV4TGdWLJqRTEk1TfpdLqEnKdj";
+export const RECAPTCHA_CO = "aHR0cHM6Ly9jb25zb2xlLmNsb3VkLmdvb2dsZS5jb206NDQz";
+export const RECAPTCHA_HL = "zh-CN";
+export const RECAPTCHA_V = "jdMmXeCQEkPbnFDy9T04NbgJ";
+
+/** v1.6.1：anchor 探测/请求 URL 构造（fetchOnce 与健康巡检 probe 共用）。
+ *  cb 为随机回调后缀。 */
+export function anchorProbeUrl(cb: string): string {
+  return (
+    RECAPTCHA_BASE +
+    "/recaptcha/enterprise/anchor?ar=1&k=" + RECAPTCHA_SITE_KEY +
+    "&co=" + RECAPTCHA_CO + "&hl=" + RECAPTCHA_HL + "&v=" + RECAPTCHA_V +
+    "&size=invisible&anchor-ms=20000&execute-ms=15000&cb=" + cb
+  );
+}
+
 // 默认安全设置（Go 版 defaultSafetySettings）：finishReason=SAFETY 重试时注入。
 export const DEFAULT_SAFETY_SETTINGS = [
   { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },

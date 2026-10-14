@@ -13,7 +13,8 @@ import type { Env } from "./config.ts";
 import { loadConfig } from "./config.ts";
 import { resolveProxyPool, refreshSubscription, subscriptionCachedAt } from "./egress/pool.ts";
 import { testProxy } from "./egress/racefetch.ts";
-import { recordProxySuccess, recordProxyFailure, flushHealthNow, ensureHealthLoaded, flushHealthIfDue, sweepDue, keepaliveDue, subscriptionDue, leastRecentlyTestedOrder, healthMapSnapshot } from "./racing.ts";
+import { testProxyAnon } from "./anon/probe.ts";
+import { recordProxySuccess, recordProxyFailure, flushHealthNow, ensureHealthLoaded, flushHealthIfDue, sweepDue, keepaliveDue, subscriptionDue, leastRecentlyTestedOrder, healthMapSnapshot, sweepBatchCap } from "./racing.ts";
 import { flushMetrics } from "./metrics.ts";
 import { flushIfDue } from "./usage.ts";
 
@@ -44,12 +45,17 @@ export interface SweepReport {
 /**
  * 执行一轮健康巡检（原项目 proxy_health_check 语义）：
  *   节点来源 = 手动列表 + 订阅缓存（不主动触发订阅刷新，由订阅刷新步骤负责）；
- *   每轮最多 batch_size 个（免费计划单次调用 50 子请求上限，batch 与 KV 读写共享额度）；
+ *   每轮最多 batch_size 个（v1.6.1：按模式钳位 sweepBatchCap —— anon 双主机探测
+ *   每节点 ≤2 子请求，钳 20 保免费计划单次调用 50 子请求上限；KV 读写共享额度）；
  *   并发 concurrency，单个超时 timeout_seconds；结果写入健康存储并立即落盘。
+ *   v1.6.1：apimode=anon 时探测目标改为 anon 双主机（anchor@www.google.com +
+ *   batchGraphql@cloudconsole-pa）—— 此前探测 generativelanguage.googleapis.com
+ *   （official 主机）对 anon 失真：节点过 official 探测却在 recaptcha 首跳就死。
  */
 export async function runHealthSweep(env: Env, cfg: Awaited<ReturnType<typeof loadConfig>>, opts?: { batchSize?: number; concurrency?: number; timeoutSeconds?: number }): Promise<SweepReport> {
   const hc = cfg.health_check;
-  const batchSize = Math.min(opts?.batchSize ?? hc.batch_size, 40);
+  const anonMode = cfg.apimode === "anon";
+  const batchSize = Math.min(opts?.batchSize ?? hc.batch_size, sweepBatchCap(cfg.apimode));
   const concurrency = Math.min(opts?.concurrency ?? hc.concurrency, 10);
   const timeoutSeconds = opts?.timeoutSeconds ?? hc.timeout_seconds;
   const started = Date.now();
@@ -67,7 +73,9 @@ export async function runHealthSweep(env: Env, cfg: Awaited<ReturnType<typeof lo
       const idx = cursor++;
       if (idx >= entries.length) return;
       const e = entries[idx];
-      const r = await testProxy(e.raw, timeoutSeconds * 1000);
+      const r = anonMode
+        ? await testProxyAnon(e.raw, timeoutSeconds * 1000)
+        : await testProxy(e.raw, timeoutSeconds * 1000);
       // 对齐原项目巡检行为：结果计入健康存储（成功刷新延迟分；失败进入指数冷却）
       if (r.ok) recordProxySuccess(e.raw, r.latency_ms);
       else recordProxyFailure(e.raw, r.error ?? "unreachable");
