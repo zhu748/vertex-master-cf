@@ -179,23 +179,21 @@ async function runChatCandidate(
   emit: (chunk: Record<string, unknown>) => boolean,
   signal?: AbortSignal,
 ): Promise<CandidateOutcome> {
+  // v1.5.0：token 抓不到（隧道死/被墙）→ 记节点失败并立即换候选。旧版在循环内
+  // 反复重抓（fetchRecaptchaToken 内部 3 隧道尝试 × 循环 4 轮 = 单候选最多 12
+  // 次隧道），既拖慢整体失败路径，又不记健康 → 死节点凭陈旧高分始终霸占候选
+  // 头部（线上实测：早最探测存活的节点 4 小时后全死，但健康分未衰减完）。
   let token = await fetchRecaptchaToken({ proxies: p ? [p] : [] }, signal);
+  if (!token) {
+    if (p) recordProxyFailure(p.raw, "recaptcha token unavailable (tunnel dead or blocked)");
+    return { kind: "relay" };
+  }
   let isFirstAuth = true;
   let attempt = 0;
   let emitted = false;
 
   while (attempt < ANON_MAX_ATTEMPTS) {
     if (signal?.aborted) return { kind: "terminal", err: new AnonUpstreamError(499, "", "client disconnected") };
-    if (!token) {
-      token = await fetchRecaptchaToken({ proxies: p ? [p] : [] }, signal);
-      if (!token) {
-        attempt++;
-        if (attempt >= ANON_MAX_ATTEMPTS) {
-          return emitted ? { kind: "terminal", err: new AnonUpstreamError(502, "", "recaptcha token unavailable") } : { kind: "relay" };
-        }
-        continue;
-      }
-    }
     const payload = buildChatPayload(params.model, params.geminiPayload, token, params.overrides, {
       dropMaxTokens: params.dropMaxTokens,
       safetySettingsMap: params.safetySettingsMap,
@@ -238,6 +236,11 @@ async function runChatCandidate(
           return emitted ? { kind: "terminal", err } : { kind: "relay" };
         }
         await sleep(1000);
+        token = await fetchRecaptchaToken({ proxies: p ? [p] : [] }, signal);
+        if (!token) {
+          if (p) recordProxyFailure(p.raw, "recaptcha token unavailable (auth refetch)");
+          return { kind: "relay" };
+        }
         continue;
       }
       if (resp.status === 429) {
@@ -298,6 +301,11 @@ async function runChatCandidate(
               return { kind: "relay" };
             }
             await sleep(1000);
+            token = await fetchRecaptchaToken({ proxies: p ? [p] : [] }, signal);
+            if (!token) {
+              if (p) recordProxyFailure(p.raw, "recaptcha token unavailable (auth refetch)");
+              return { kind: "relay" };
+            }
             continue;
           }
           // 已产出内容后的 auth 错误：终止（语义错误透传）
@@ -593,7 +601,11 @@ export async function callAnonCountTokens(
       if (budget <= 0) break;
       budget--;
       const token = await fetchRecaptchaToken({ proxies: p ? [p] : [] }, signal);
-      if (!token) continue;
+      if (!token) {
+        // v1.5.0：token 抓不到同样记节点失败（死隧道不应凭陈旧高分霸占候选头）
+        if (p) recordProxyFailure(p.raw, "recaptcha token unavailable");
+        continue;
+      }
       const payload = buildCountTokensPayload(model, contents, token, overrides);
       // Go counttokens.go：同一 token 允许一次首验重试（匿名端点首帧预期 verify-fail）
       for (let attempt = 0; attempt < 2; attempt++) {
