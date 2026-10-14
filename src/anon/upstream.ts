@@ -47,6 +47,10 @@ const ANON_MAX_ATTEMPTS = 4; // 单候选内最大尝试（首验重试 + 换 to
  *  每次候选调用约 3~5 个 socket（1 recaptcha 隧道 + ≤4 batchGraphql 隧道），
  *  预算 6 次 ≈ 30 子请求，加上 KV 读写仍在免费版 50 限额内。 */
 const ANON_CANDIDATE_BUDGET = 6;
+/** v1.5.4：单候选「产出内容前」阶段截止 —— 坏节点 token 抓取内部 3 次尝试
+ *  各自可停滞至 recaptcha body 超时，不加限制时整轮被最慢者拖到 45s+。
+ *  任一候选产出内容即全部解除（胜者的长生成不受限制）。 */
+const ANON_CANDIDATE_PRE_CONTENT_DEADLINE_MS = 22_000;
 const ANON_CONNECT_TIMEOUT_MS = 15_000;
 const ANON_HANDSHAKE_TIMEOUT_MS = 15_000;
 const ANON_TLS_TIMEOUT_MS = 12_000;
@@ -431,14 +435,24 @@ async function raceChatCandidates(
     const cands = pool.filter(() => budget-- > 0);
     if (cands.length === 0) break;
 
-    // 每候选独立 AbortController：owner 产生即中止其余候选（父 signal 中止全部）
+    // 每候选独立 AbortController：owner 产生即中止其余候选（父 signal 中止全部）；
+    // v1.5.4：内容前阶段截止计时器（任一候选产出内容即全部解除）
     const aborts = cands.map(() => new AbortController());
+    const deadlines: Array<ReturnType<typeof setTimeout>> = [];
+    aborts.forEach((a) => {
+      deadlines.push(setTimeout(() => a.abort(), ANON_CANDIDATE_PRE_CONTENT_DEADLINE_MS));
+    });
+    const clearDeadlines = () => {
+      for (const t of deadlines) clearTimeout(t);
+    };
     const onParentAbort = () => {
+      clearDeadlines();
       for (const a of aborts) a.abort();
     };
     signal?.addEventListener("abort", onParentAbort, { once: true });
     let owner = -1; // 首个产出内容的候选
     const abortLosers = (idx: number) => {
+      clearDeadlines(); // 有内容了：长生成不受截止限制
       for (let j = 0; j < aborts.length; j++) {
         if (j !== idx) aborts[j].abort();
       }
@@ -463,6 +477,7 @@ async function raceChatCandidates(
       }),
     );
     signal?.removeEventListener("abort", onParentAbort);
+    clearDeadlines();
 
     if (owner >= 0) {
       // owner 完成：其 terminal（内容后错误）作为终局错误
@@ -476,7 +491,10 @@ async function raceChatCandidates(
     // 本轮无内容：汇总 relay/terminal 信息决定是否换轮
     let round429 = false;
     for (const out of outcomes) {
-      if (out.kind === "terminal") lastTerminal = out.err;
+      if (out.kind === "terminal") {
+        // 499 = 中止伪状态（截止时间/客户端断开），非真实上游错误，不计入终局
+        if (out.err.status !== 499) lastTerminal = out.err;
+      }
       if (out.kind === "relay" && out.err?.status === 429) {
         round429 = true;
         last429 = out.err;
