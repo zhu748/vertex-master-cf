@@ -145,7 +145,7 @@ test("recordProxyRateLimit: 上游明示 20.46s → 冷却 23s（+2s 缓冲）�
 
 // ---------- v2.5.1：429 计次惩罚 + 降级让位（全池轮换 ≈ 接近无限额度） ----------
 
-const RACING_CFG: RacingConfig = { enabled: true, top_k: 6, max_concurrent: 3, hedge_delay_ms: 1000, dynamic_delay: false, max_attempts: 8, node_retry: true };
+const RACING_CFG: RacingConfig = { enabled: true, top_k: 6, max_concurrent: 3, hedge_delay_ms: 1000, dynamic_delay: false, max_attempts: 8, node_retry: true, rate_limit_retries: 1 };
 const NOW = Date.now();
 
 function mkHealth(partial: Partial<ProxyHealth>): ProxyHealth {

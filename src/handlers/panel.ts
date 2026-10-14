@@ -293,7 +293,7 @@ const PANEL_HTML = `
       <h3 style="margin:0">对冲竞速配置（移植自原项目 race engine）</h3>
       <button class="btn" id="race-save">保存竞速配置</button>
     </div>
-    <div class="hint" style="margin-bottom:12px">开启后每个请求按健康分选出多个候选节点：首个立即发出，每隔对冲延迟追加下一个，首胜即停、败者立即中止；429/失败节点自动冷却并接力。关闭则退回「健康分排序 + 轮换 + 故障接力」。</div>
+    <div class="hint" style="margin-bottom:12px">开启后每个请求按健康分选出多个候选节点：首个立即发出，每隔对冲延迟追加下一个，首胜即停、败者立即中止；429/失败节点自动冷却并接力；v1.4.0 起整轮 429 耗尽后还会等窗口恢复、重新选点再战，全部轮次耗尽才直连兜底。关闭则退回「健康分排序 + 轮换 + 故障接力」。</div>
     <div class="grid g2">
       <div class="field">
         <label class="row" style="gap:10px;cursor:pointer"><input type="checkbox" id="race-enabled" style="width:auto"> 启用并发竞速</label>
@@ -322,6 +322,11 @@ const PANEL_HTML = `
       <div class="field">
         <label>单请求最多尝试节点数 max_attempts（1~20）</label>
         <input id="race-ma" type="number" min="1" max="20" style="width:140px">
+      </div>
+      <div class="field">
+        <label>整轮 429 重试轮次 rate_limit_retries（0~3）</label>
+        <input id="race-rlr" type="number" min="0" max="3" style="width:140px">
+        <div class="hint">v1.4.0：一轮候选全部撞 per-IP 窗口限流后，等最早恢复窗口（钳 250ms~8s）重新选点再战；跨轮总尝试钳 40</div>
       </div>
     </div>
   </div>
@@ -880,6 +885,7 @@ function renderRaceForm(){
   $("race-mc").value = r.max_concurrent != null ? r.max_concurrent : 3;
   $("race-delay").value = r.hedge_delay_ms != null ? r.hedge_delay_ms : 1000;
   $("race-ma").value = r.max_attempts != null ? r.max_attempts : 8;
+  $("race-rlr").value = r.rate_limit_retries != null ? r.rate_limit_retries : 1;
   var hc = (CFG && CFG.health_check) || {};
   $("hc-enabled").checked = hc.enabled === undefined ? true : !!hc.enabled;
   $("hc-interval").value = hc.interval_minutes != null ? hc.interval_minutes : 15;
@@ -941,7 +947,8 @@ $("race-save").onclick = function(){
     top_k: parseInt($("race-topk").value, 10) || 6,
     max_concurrent: parseInt($("race-mc").value, 10) || 3,
     hedge_delay_ms: parseInt($("race-delay").value, 10) || 1000,
-    max_attempts: parseInt($("race-ma").value, 10) || 8
+    max_attempts: parseInt($("race-ma").value, 10) || 8,
+    rate_limit_retries: parseInt($("race-rlr").value, 10)
   } };
   btn.disabled = true; btn.textContent = "保存中...";
   api("/config", { method: "POST", body: JSON.stringify(body) }).then(function(j){

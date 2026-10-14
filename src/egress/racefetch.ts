@@ -10,6 +10,11 @@
 //         在飞数不超过 max_concurrent；任一候选拿到可用响应即胜出并中止其余候选；
 //       * 429 按体分类：单 IP 滑动窗口限流 → 冷却节点 + 接力；项目级每日配额（PerDay）
 //         → 请求级硬错误立即透传；
+//       * v1.4.0 整轮 429 重试：一轮候选全部撞 per-IP 窗口限流后，等待最早恢复窗口
+//         （钳 250ms~8s）并重新 selectCandidates 再战一轮（被冷却节点自然让位 →
+//         天然换 IP 轮转）；轮次由 rate_limit_retries 控制（0~3），跨轮总尝试数
+//         钳 TOTAL_ATTEMPT_CAP=40 保护免费计划 50 子请求/请求限额；全轮耗尽仍 429
+//         → PoolRateLimitedError → 直连兜底（独立出口 IP，不计熔断）；
 //       * 5xx/连接失败 → 记失败冷却 + 极速接力；其它 4xx → 请求级硬错误（不惩罚节点）；
 //       * v2.5.3 伪造密钥错误接力验证：可疑 4xx 首中记失败并接力，第二个节点同类
 //         错误才判真实；
@@ -40,6 +45,8 @@ import {
   isCooling,
   classify429Body,
   isSuspiciousAuthError,
+  rateLimitRoundWaitMs,
+  TOTAL_ATTEMPT_CAP,
   type Quota429Class,
   proxyHealth,
   recordProxyFailure,
@@ -393,61 +400,138 @@ async function retrySameNodeOnce(
 
 let rrCursor = 0;
 
-/** 顺序模式：按健康分排序后轮换，最多接力 3 个，429/5xx 也接力 */
-export async function rotateUpstream(url: string, init: RequestInit, pool: ProxyPool, nodeRetry = false): Promise<UpstreamResult> {
-  const order = healthyOrder(pool.entries);
-  const maxTry = Math.min(order.length, 3);
-  const errors: string[] = [];
-  const retried = new Set<string>();
-  let seenSuspect = false;
-  const start = order.length > 0 ? rrCursor % order.length : 0;
-  rrCursor = (rrCursor + 1) % Math.max(1, order.length);
-  for (let i = 0; i < maxTry; i++) {
-    const p = order[(start + i) % order.length];
-    const r = await attemptOnce(p, url, init);
-    if (r.resp && r.resp.status < 400) {
-      recordProxySuccess(p.raw, r.ms);
-      return { response: r.resp, via: p.raw };
-    }
-    if (r.resp && r.resp.status === 429) {
-      // 仅项目级每日配额硬透传；单 IP 窗口限流冷却该节点后接力（每 IP 独立窗口）
-      if (r.q429?.level === "project") return { response: r.resp, via: p.raw };
-      recordProxyRateLimit(p.raw, Date.now(), r.q429?.retryAfterSecs);
-      errors.push("[" + p.raw + "] 429 Rate Limit" + (r.q429?.retryAfterSecs != null ? " (retry " + Math.ceil(r.q429.retryAfterSecs) + "s)" : ""));
-      void r.resp.body?.cancel().catch(() => {});
-      continue;
-    }
-    if (r.resp && r.resp.status >= 500) {
-      recordProxyFailure(p.raw, "HTTP " + r.resp.status);
-      errors.push("[" + p.raw + "] HTTP " + r.resp.status);
-      void r.resp.body?.cancel().catch(() => {});
-      if (nodeRetry && !retried.has(p.raw)) {
-        retried.add(p.raw);
-        const again = await retrySameNodeOnce(p, url, init, errors, "5xx");
-        if (again) return { response: again, via: p.raw };
+/** 丢弃一个不再需要的响应体（连接回池/释放资源） */
+const dropResp = (resp: Response | null | undefined): void => {
+  if (resp) void resp.body?.cancel().catch(() => {});
+};
+
+/** v1.4.0：全轮 429（per-IP 窗口限流）耗尽 —— 携带最后的 429 响应交由
+ *  dispatchUpstream 直连兜底（Workers 自身出口 IP = 独立限流窗口）；
+ *  直连也失败时透传该响应。不计入池熔断：per-IP 窗口秒级即恢复，
+ *  10 分钟熔断过重（那是给「池整体坏了」准备的）。 */
+export class PoolRateLimitedError extends Error {
+  readonly resp: Response;
+  readonly via: string;
+  constructor(resp: Response, via: string) {
+    super("proxy pool rate-limited: all rounds exhausted with per-IP 429");
+    this.name = "PoolRateLimitedError";
+    this.resp = resp;
+    this.via = via;
+  }
+}
+
+/** v1.4.0：整轮 429 重试前的等待 —— 池内还有可选节点（非冷却/未测试）时
+ *  立即换点再战（0ms）；全池冷却时等到最早恢复者（钳 250ms~8s）。 */
+function poolRoundWaitMs(pool: ProxyPool): number {
+  const now = Date.now();
+  const cooldowns: number[] = [];
+  for (const e of pool.entries) {
+    const h = proxyHealth(e.raw);
+    if (!h) return 0; // 存在未测试节点：立即可换
+    if (!isCooling(h, now)) return 0; // 有活节点：立即换点
+    cooldowns.push(h.cooldown_until);
+  }
+  return rateLimitRoundWaitMs(cooldowns, now);
+}
+
+/** 顺序模式：按健康分排序后轮换，每轮最多接力 3 个；v1.4.0 整轮 429 重试 ——
+ *  一轮撞过 per-IP 429 且还有轮次/预算时，等待最早恢复窗口后重新排序再战
+ *  （被冷却节点自然沉底 → 天然换 IP；单节点池即等窗口恢复后重试同节点）。
+ *  全轮耗尽仍以 429 收尾 → 抛 PoolRateLimitedError（上层直连兜底）。 */
+export async function rotateUpstream(
+  url: string,
+  init: RequestInit,
+  pool: ProxyPool,
+  nodeRetry = false,
+  rateLimitRounds = 0,
+): Promise<UpstreamResult> {
+  let attemptsUsed = 0;
+  for (let round = 0; ; round++) {
+    const order = healthyOrder(pool.entries);
+    const maxTry = Math.min(order.length, 3, TOTAL_ATTEMPT_CAP - attemptsUsed);
+    const errors: string[] = [];
+    const retried = new Set<string>();
+    let seenSuspect = false;
+    let roundSaw429 = false;
+    let lastWas429 = false;
+    let live429: { resp: Response; via: string } | null = null;
+    const start = order.length > 0 ? rrCursor % order.length : 0;
+    rrCursor = (rrCursor + 1) % Math.max(1, order.length);
+    for (let i = 0; i < maxTry; i++) {
+      const p = order[(start + i) % order.length];
+      attemptsUsed++;
+      const r = await attemptOnce(p, url, init);
+      lastWas429 = false;
+      if (r.resp && r.resp.status < 400) {
+        recordProxySuccess(p.raw, r.ms);
+        dropResp(live429?.resp);
+        return { response: r.resp, via: p.raw };
       }
-      continue;
-    }
-    if (r.resp) {
-      // 请求级 4xx：与代理无关，直接返回（不惩罚节点、不接力）；可疑伪造错误例外
-      if (r.suspect4xx && !seenSuspect) {
-        seenSuspect = true;
-        recordProxyFailure(p.raw, "suspicious auth error (likely forged by proxy)");
-        errors.push("[" + p.raw + "] suspicious auth error → 接力验证");
-        void r.resp.body?.cancel().catch(() => {});
+      if (r.resp && r.resp.status === 429) {
+        // 仅项目级每日配额硬透传；单 IP 窗口限流冷却该节点后接力（每 IP 独立窗口）
+        if (r.q429?.level === "project") {
+          dropResp(live429?.resp);
+          return { response: r.resp, via: p.raw };
+        }
+        recordProxyRateLimit(p.raw, Date.now(), r.q429?.retryAfterSecs);
+        errors.push("[" + p.raw + "] 429 Rate Limit" + (r.q429?.retryAfterSecs != null ? " (retry " + Math.ceil(r.q429.retryAfterSecs) + "s)" : ""));
+        roundSaw429 = true;
+        lastWas429 = true;
+        dropResp(live429?.resp);
+        live429 = { resp: r.resp, via: p.raw }; // 保活：轮末 429 透传/兜底要用，不能 cancel
         continue;
       }
-      return { response: r.resp, via: p.raw };
+      if (r.resp && r.resp.status >= 500) {
+        recordProxyFailure(p.raw, "HTTP " + r.resp.status);
+        errors.push("[" + p.raw + "] HTTP " + r.resp.status);
+        void r.resp.body?.cancel().catch(() => {});
+        if (nodeRetry && !retried.has(p.raw) && attemptsUsed < TOTAL_ATTEMPT_CAP) {
+          retried.add(p.raw);
+          attemptsUsed++;
+          const again = await retrySameNodeOnce(p, url, init, errors, "5xx");
+          if (again) {
+            dropResp(live429?.resp);
+            return { response: again, via: p.raw };
+          }
+        }
+        continue;
+      }
+      if (r.resp) {
+        // 请求级 4xx：与代理无关，直接返回（不惩罚节点、不接力）；可疑伪造错误例外
+        if (r.suspect4xx && !seenSuspect) {
+          seenSuspect = true;
+          recordProxyFailure(p.raw, "suspicious auth error (likely forged by proxy)");
+          errors.push("[" + p.raw + "] suspicious auth error → 接力验证");
+          void r.resp.body?.cancel().catch(() => {});
+          continue;
+        }
+        dropResp(live429?.resp);
+        return { response: r.resp, via: p.raw };
+      }
+      recordProxyFailure(p.raw, r.error ?? "network error");
+      errors.push("[" + p.raw + "] " + (r.error ?? "network error"));
+      if (nodeRetry && !retried.has(p.raw) && attemptsUsed < TOTAL_ATTEMPT_CAP) {
+        retried.add(p.raw);
+        attemptsUsed++;
+        const again = await retrySameNodeOnce(p, url, init, errors, "network");
+        if (again) {
+          dropResp(live429?.resp);
+          return { response: again, via: p.raw };
+        }
+      }
     }
-    recordProxyFailure(p.raw, r.error ?? "network error");
-    errors.push("[" + p.raw + "] " + (r.error ?? "network error"));
-    if (nodeRetry && !retried.has(p.raw)) {
-      retried.add(p.raw);
-      const again = await retrySameNodeOnce(p, url, init, errors, "network");
-      if (again) return { response: again, via: p.raw };
+    // 轮末：本轮撞过 per-IP 429 且还有轮次与预算 → 等窗口恢复再战（v1.4.0）
+    if (roundSaw429 && live429 && round < rateLimitRounds && attemptsUsed < TOTAL_ATTEMPT_CAP) {
+      const wait = poolRoundWaitMs(pool);
+      await sleep(wait > 0 ? wait + Math.random() * 250 : 0); // 抖动错峰并发重试端群
+      continue;
     }
+    if (live429 && lastWas429) {
+      // 全轮耗尽仍以 429 收尾：交由上层直连兜底（独立出口 IP）
+      throw new PoolRateLimitedError(live429.resp, live429.via);
+    }
+    throw new Error("all proxy attempts failed: " + errors.join(" | "));
   }
-  throw new Error("all proxy attempts failed: " + errors.join(" | "));
 }
 
 type AttemptKind = "ok" | "ratelimit" | "retryable" | "hard" | "hard-suspect" | "aborted";
@@ -499,55 +583,39 @@ async function runAttempt(p: ProxyEntry, url: string, init: RequestInit, signal:
   }
 }
 
-/** 对冲竞速：首胜即停，败者中止；健康度记录随竞速自动进行 */
-export async function raceUpstream(
+/** 单轮竞速的耗尽详情（未分胜负时返回，供外层决定是否整轮 429 重试） */
+interface RaceExhaustion {
+  /** 轮内最后一个拿到的响应（429/5xx 等；纯网络失败时为 null） */
+  lastResp: Response | null;
+  lastVia: string;
+  /** 最后一次尝试结论是否为 per-IP 429 */
+  lastWas429: boolean;
+  /** 本轮是否撞过 429（触发整轮重试的依据） */
+  any429: boolean;
+  errors: string[];
+  attempts: number;
+}
+
+type RaceRoundOutcome = { ok: true; response: Response; via: string } | { ok: false; exhaust: RaceExhaustion };
+
+/** 单轮对冲竞速：首胜即停、败者中止；健康度记录随竞速自动进行。
+ *  轮末未分胜负时返回耗尽详情（不抛错），由外层 raceUpstream 决定重试或收尾。 */
+function raceOnce(
   url: string,
   init: RequestInit,
-  pool: ProxyPool,
+  candidates: ProxyEntry[],
   racing: RacingConfig,
-  waitUntil: (p: Promise<unknown>) => void,
-): Promise<UpstreamResult> {
-  const now = Date.now();
-  const candidates = warmFirst(selectCandidates(pool.entries, healthMapSnapshot(), racing, now));
-  if (candidates.length <= 1) {
-    if (candidates.length === 1) {
-      const only = candidates[0];
-      const r = await attemptOnce(only, url, init);
-      if (r.resp) {
-        const kind = classifyStatus(r.resp.status);
-        if (kind === "ok") recordProxySuccess(only.raw, r.ms);
-        else if (kind === "ratelimit") {
-          if (r.q429?.level === "project") return { response: r.resp, via: only.raw };
-          recordProxyRateLimit(only.raw, Date.now(), r.q429?.retryAfterSecs);
-        } else if (kind === "retryable") {
-          recordProxyFailure(only.raw, "HTTP " + r.resp.status);
-          if (racing.node_retry) {
-            const again = await retrySameNodeOnce(only, url, init, [], "single-candidate");
-            if (again) return { response: again, via: only.raw };
-          }
-        } else if (kind === "hard" && r.suspect4xx) {
-          recordProxyFailure(only.raw, "suspicious auth error (likely forged by proxy)");
-        }
-        return { response: r.resp, via: only.raw };
-      }
-      recordProxyFailure(only.raw, r.error ?? "network error");
-      if (racing.node_retry) {
-        const again = await retrySameNodeOnce(only, url, init, [], "single-candidate");
-        if (again) return { response: again, via: only.raw };
-      }
-      throw new Error("upstream attempt failed: " + (r.error ?? "network error"));
-    }
-    return rotateUpstream(url, init, pool, racing.node_retry);
-  }
-
-  const hedge = racing.dynamic_delay ? clampNum(averageLatency(healthMapSnapshot(), now), 100, 10_000) : racing.hedge_delay_ms;
-
-  return new Promise<UpstreamResult>((resolve, reject) => {
+  hedge: number,
+): Promise<RaceRoundOutcome> {
+  return new Promise<RaceRoundOutcome>((resolve) => {
     let nextIdx = 0;
     let active = 0;
     let settled = false;
     let lastResp: Response | null = null;
     let lastVia = "race";
+    let lastWas429 = false;
+    let any429 = false;
+    let attempts = 0;
     const errors: string[] = [];
     const controllers = new Map<string, AbortController>();
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -583,6 +651,7 @@ export async function raceUpstream(
       const ac = new AbortController();
       controllers.set(p.raw, ac);
       active++;
+      attempts++;
       runAttempt(p, url, init, ac.signal)
         .then((res) => onResult(p, res))
         .catch((err) => onResult(p, { kind: "retryable", ms: 0, error: err instanceof Error ? err.message : String(err) }));
@@ -595,9 +664,6 @@ export async function raceUpstream(
           if (launch()) scheduleHedge();
         }, hedge);
       }
-    };
-    const dropResp = (resp: Response | null | undefined) => {
-      if (resp) void resp.body?.cancel().catch(() => {});
     };
 
     const onResult = (p: ProxyEntry, res: AttemptResult) => {
@@ -615,12 +681,12 @@ export async function raceUpstream(
 
       if (res.kind === "ok") {
         abortLosers();
-        finish(() => resolve({ response: res.resp!, via: p.raw }));
+        finish(() => resolve({ ok: true, response: res.resp!, via: p.raw }));
         return;
       }
       if (res.kind === "hard") {
         abortLosers();
-        finish(() => resolve({ response: res.resp!, via: p.raw }));
+        finish(() => resolve({ ok: true, response: res.resp!, via: p.raw }));
         return;
       }
       if (res.kind === "hard-suspect") {
@@ -628,7 +694,7 @@ export async function raceUpstream(
         suspectHits++;
         if (suspectHits >= 2) {
           abortLosers();
-          finish(() => resolve({ response: res.resp!, via: p.raw }));
+          finish(() => resolve({ ok: true, response: res.resp!, via: p.raw }));
           return;
         }
         recordProxyFailure(p.raw, "suspicious auth error (likely forged by proxy)");
@@ -636,7 +702,7 @@ export async function raceUpstream(
         if (nextIdx >= candidates.length && active === 0) {
           const resp = res.resp;
           const via = p.raw;
-          finish(() => resolve({ response: resp!, via }));
+          finish(() => resolve({ ok: true, response: resp!, via }));
           return;
         }
         dropResp(res.resp);
@@ -646,7 +712,9 @@ export async function raceUpstream(
       }
 
       // ratelimit / retryable：极速接力
+      lastWas429 = res.kind === "ratelimit";
       if (res.kind === "ratelimit") {
+        any429 = true;
         recordProxyRateLimit(p.raw, Date.now(), res.retryAfterSecs);
       }
       if (res.resp) {
@@ -657,20 +725,103 @@ export async function raceUpstream(
       launch();
       scheduleHedge();
       if (active === 0 && nextIdx >= candidates.length) {
-        const resp = lastResp;
-        const via = lastVia;
-        const errs = errors.join(" | ");
-        finish(() => {
-          if (resp) resolve({ response: resp, via });
-          else reject(new Error("race: all " + candidates.length + " candidates failed: " + errs));
-        });
+        const exhaust: RaceExhaustion = { lastResp, lastVia, lastWas429, any429, errors: errors.slice(), attempts };
+        finish(() => resolve({ ok: false, exhaust }));
       }
     };
 
     launch();
     scheduleHedge();
-    void waitUntil;
   });
+}
+
+/** 对冲竞速（v1.4.0 多轮化）：每轮重新 selectCandidates（上轮 429 冷却节点自然
+ *  让位 → 天然换 IP 轮转），单轮首胜即停；一轮撞过 per-IP 429 且还有轮次/预算时，
+ *  等待最早恢复窗口（池内仍有活节点则立即换点，钳 250ms~8s）再战一轮。
+ *  全轮耗尽仍以 429 收尾 → 抛 PoolRateLimitedError（上层直连兜底）。 */
+export async function raceUpstream(
+  url: string,
+  init: RequestInit,
+  pool: ProxyPool,
+  racing: RacingConfig,
+  waitUntil: (p: Promise<unknown>) => void,
+): Promise<UpstreamResult> {
+  void waitUntil;
+  let attemptsUsed = 0;
+  let finalLive429: { resp: Response; via: string } | null = null;
+  let lastEx: RaceExhaustion | null = null;
+  for (let round = 0; ; round++) {
+    // 跨轮总尝试预算（免费计划 50 子请求/请求，预留直连兜底与 KV 余量）
+    const budget = Math.min(racing.max_attempts, TOTAL_ATTEMPT_CAP - attemptsUsed);
+    if (budget <= 0) break;
+    const roundCfg: RacingConfig = budget >= racing.max_attempts ? racing : { ...racing, max_attempts: Math.max(1, budget) };
+    const now = Date.now();
+    const candidates = warmFirst(selectCandidates(pool.entries, healthMapSnapshot(), roundCfg, now));
+    if (candidates.length === 0) {
+      return await rotateUpstream(url, init, pool, racing.node_retry, racing.rate_limit_retries);
+    }
+    if (candidates.length === 1) {
+      const only = candidates[0];
+      attemptsUsed++;
+      const r = await attemptOnce(only, url, init);
+      if (r.resp) {
+        const kind = classifyStatus(r.resp.status);
+        if (kind === "ok") {
+          recordProxySuccess(only.raw, r.ms);
+          return { response: r.resp, via: only.raw };
+        }
+        if (kind === "ratelimit") {
+          if (r.q429?.level === "project") return { response: r.resp, via: only.raw };
+          recordProxyRateLimit(only.raw, Date.now(), r.q429?.retryAfterSecs);
+          // v1.4.0：单候选撞 per-IP 窗口 → 等窗口恢复再战（重选后可能换出其他节点）
+          if (round < racing.rate_limit_retries && attemptsUsed < TOTAL_ATTEMPT_CAP) {
+            const wait = poolRoundWaitMs(pool);
+            await sleep(wait > 0 ? wait + Math.random() * 250 : 0);
+            continue;
+          }
+          throw new PoolRateLimitedError(r.resp, only.raw);
+        }
+        if (kind === "retryable") {
+          recordProxyFailure(only.raw, "HTTP " + r.resp.status);
+          if (racing.node_retry && attemptsUsed < TOTAL_ATTEMPT_CAP) {
+            attemptsUsed++;
+            const again = await retrySameNodeOnce(only, url, init, [], "single-candidate");
+            if (again) return { response: again, via: only.raw };
+          }
+        } else if (kind === "hard" && r.suspect4xx) {
+          recordProxyFailure(only.raw, "suspicious auth error (likely forged by proxy)");
+        }
+        return { response: r.resp, via: only.raw };
+      }
+      recordProxyFailure(only.raw, r.error ?? "network error");
+      if (racing.node_retry && attemptsUsed < TOTAL_ATTEMPT_CAP) {
+        attemptsUsed++;
+        const again = await retrySameNodeOnce(only, url, init, [], "single-candidate");
+        if (again) return { response: again, via: only.raw };
+      }
+      throw new Error("upstream attempt failed: " + (r.error ?? "network error"));
+    }
+
+    const hedge = racing.dynamic_delay ? clampNum(averageLatency(healthMapSnapshot(), now), 100, 10_000) : racing.hedge_delay_ms;
+    const outcome = await raceOnce(url, init, candidates, roundCfg, hedge);
+    if (outcome.ok) return { response: outcome.response, via: outcome.via };
+    attemptsUsed += outcome.exhaust.attempts;
+    lastEx = outcome.exhaust;
+    // 本轮以 429 收尾 → 记为最终 429 候选（供直连兜底失败时透传）；非 429 收尾则作废旧 429
+    dropResp(finalLive429?.resp);
+    finalLive429 = lastEx.lastWas429 && lastEx.lastResp ? { resp: lastEx.lastResp, via: lastEx.lastVia } : null;
+    // v1.4.0 整轮 429 重试：本轮撞过 per-IP 429 且还有轮次与预算 → 等最早恢复窗口再战
+    if (lastEx.any429 && round < racing.rate_limit_retries && attemptsUsed < TOTAL_ATTEMPT_CAP) {
+      const wait = poolRoundWaitMs(pool);
+      await sleep(wait > 0 ? wait + Math.random() * 250 : 0); // 抖动错峰并发重试蜂拥
+      continue;
+    }
+    break;
+  }
+  // 全轮耗尽
+  if (finalLive429) throw new PoolRateLimitedError(finalLive429.resp, finalLive429.via);
+  if (lastEx?.lastResp) return { response: lastEx.lastResp, via: lastEx.lastVia }; // 5xx 等真实上游响应仍透传（维持原语义）
+  throw new Error("race: all candidates failed: " + (lastEx?.errors.join(" | ") ?? "no candidates"));
 }
 
 // ---------- 直连与统一入口 ----------
@@ -692,9 +843,10 @@ export { poolBreakerSnapshot };
 /**
  * 统一出站 fetch：
  *   - 无代理池 / 熔断打开 → 直连（429/408/425/5xx 退避重试一次）；
- *   - 竞速关闭或池中仅 1 节点 → 健康排序轮换 + 故障接力；
- *   - 竞速开启 → 对冲竞速；
- *   - 全池失败 → 熔断计数 + 直连兜底。
+ *   - 竞速关闭或池中仅 1 节点 → 健康排序轮换 + 故障接力（v1.4.0 起含整轮 429 重试）；
+ *   - 竞速开启 → 对冲竞速（v1.4.0 起含整轮 429 重试）；
+ *   - 全轮 429 耗尽 → 直连兜底（不计熔断：per-IP 窗口秒级恢复，熔断 10 分钟过重）；
+ *   - 其它全池失败 → 熔断计数 + 直连兜底。
  */
 export async function dispatchUpstream(
   url: string,
@@ -717,11 +869,24 @@ export async function dispatchUpstream(
   let result: UpstreamResult;
   try {
     if (!rc.enabled || pool!.size === 1) {
-      result = await rotateUpstream(url, init, pool!, rc.node_retry);
+      result = await rotateUpstream(url, init, pool!, rc.node_retry, rc.rate_limit_retries);
     } else {
       result = await raceUpstream(url, init, pool!, rc, waitUntil);
     }
   } catch (err) {
+    if (err instanceof PoolRateLimitedError) {
+      // v1.4.0：整轮 429 耗尽 —— per-IP 窗口限流是瞬态，不计熔断。直连走 Workers
+      // 自身出口 IP（独立限流窗口，自带 429 退避重试一次）；直连网络失败才透传
+      // 代理侧的 429 原响应。
+      waitUntil(flushHealthIfDue(env));
+      try {
+        const resp = await directFetchWithRetry(url, init);
+        dropResp(err.resp);
+        return { response: resp, via: "direct(pool-rate-limited)" };
+      } catch {
+        return { response: err.resp, via: err.via };
+      }
+    }
     const msg = err instanceof Error ? err.message : String(err);
     const signature = PLATFORM_TLS_FAILURE_SIGNATURE.test(msg);
     const opened = breakerOnPoolFailure(signature);

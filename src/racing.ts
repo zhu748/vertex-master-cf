@@ -33,6 +33,11 @@ export interface RacingConfig {
   max_attempts: number;
   /** 节点内重试（原项目 parallel_pool_retry_enabled）：网络/5xx 错误时同一节点立即重试一次；429 仍直接冷却换节点 */
   node_retry: boolean;
+  /** v1.4.0：整轮 429 重试次数 —— 一轮候选全部撞 per-IP 窗口限流后，等待最早恢复
+   *  窗口（钳 250ms~8s）并重新选点再战一轮（每轮重新 selectCandidates，被冷却
+   *  节点自然让位 → 天然换 IP 轮转）。0 = 关闭（耗尽即兜底）；project 级每日
+   *  配额仍硬透传不受此影响。总尝试数受 TOTAL_ATTEMPT_CAP 保护。 */
+  rate_limit_retries: number;
 }
 
 export const DEFAULT_RACING: RacingConfig = {
@@ -43,6 +48,7 @@ export const DEFAULT_RACING: RacingConfig = {
   dynamic_delay: false,
   max_attempts: 8,
   node_retry: true,
+  rate_limit_retries: 1,
 };
 
 // ---------- 定时健康巡检（原项目 proxy_health_check_*，Workers 用 Cron Triggers 驱动） ----------
@@ -98,6 +104,7 @@ export function sanitizeRacingConfig(raw: unknown): RacingConfig {
     dynamic_delay: !!d.dynamic_delay,
     max_attempts: clampInt(d.max_attempts, DEFAULT_RACING.max_attempts, 1, 20),
     node_retry: d.node_retry === undefined ? DEFAULT_RACING.node_retry : !!d.node_retry,
+    rate_limit_retries: clampInt(d.rate_limit_retries, DEFAULT_RACING.rate_limit_retries, 0, 3),
   };
 }
 
@@ -294,6 +301,28 @@ export function averageLatency(healthMap: Map<string, ProxyHealth>, now: number)
     }
   }
   return count === 0 ? 500 : sum / count;
+}
+
+// ---------- v1.4.0：整轮 429 重试（纯函数，Node 可单测） ----------
+
+/** 跨轮总尝试预算：免费计划单请求子请求上限 50，预留直连兜底/保活余量。
+ *  防御 max_attempts=20 × (1+rate_limit_retries=3) = 80 打爆限额。 */
+export const TOTAL_ATTEMPT_CAP = 40;
+
+/** 429 重试轮的等待上限（毫秒）：per-IP 窗口典型 ~20s 即恢复，等待过久不如
+ *  尽早把 429 透传给客户端（调用方自带直连兜底）。 */
+export const RATE_LIMIT_ROUND_WAIT_MAX_MS = 8_000;
+
+/** 429 重试轮等待时长：传入本轮仍处于冷却的候选节点的 cooldown_until（epoch 秒）。
+ *  - 空列表（有非冷却新候选可换）→ 0，立即换点再战；
+ *  - 有冷却候选 → 等到最早恢复者，钳位 [250ms, 8s]（等待中不耗 CPU，只耗墙钟）。
+ *  全部候选冷却且最早恢复仍很远时，只等 8s 就带上「最早恢复」的节点再战 ——
+ *  宁可重试可能仍限流的节点，也不让客户端干等分钟级。 */
+export function rateLimitRoundWaitMs(cooldownUntilSecs: number[], nowMs: number): number {
+  const future = cooldownUntilSecs.filter((s) => Number.isFinite(s) && s * 1000 > nowMs);
+  if (future.length === 0) return 0;
+  const earliest = Math.min(...future) * 1000;
+  return Math.min(Math.max(earliest - nowMs, 250), RATE_LIMIT_ROUND_WAIT_MAX_MS);
 }
 
 // ---------- v2.5.0：429 分类（纯函数，Node 可单测） ----------
