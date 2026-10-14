@@ -20,7 +20,7 @@ import { orderedCandidates, poolRoundWaitMs } from "../egress/racefetch.ts";
 import { closeQuietly, sleep, tcpConnect, withTimeout } from "../egress/sockets.ts";
 import { ByteBufReader } from "../egress/byteio.ts";
 import { proxyHandshake } from "../egress/handshake.ts";
-import { determineBodyShape, isBodylessStatus, makeBodyStream, parseResponseHeadBlock, readFullBody } from "../egress/httpio.ts";
+import { applyContentDecoding, decodeFullBodyBytes, determineBodyShape, isBodylessStatus, makeBodyStream, parseResponseHeadBlock, readFullBody } from "../egress/httpio.ts";
 import { Tls13Client, invalidateSessionTicket } from "../egress/tls13.ts";
 import { classify429Body, ensureHealthLoaded, recordProxyFailure, recordProxyRateLimit, recordProxySuccess } from "../racing.ts";
 import { fetchRecaptchaToken } from "./recaptcha.ts";
@@ -139,17 +139,25 @@ async function requestViaCandidate(
       outHeaders.set(k, v);
     }
     if (shape.chunked || shape.contentLength !== null) {
-      // 流式体：ReadableStream 透传（调用方整读或扫描）
-      const bodyStream = makeBodyStream(tlsReader, shape, () => {
+      // 流式体：ReadableStream 透传（调用方整读或扫描）；v1.5.3 Content-Encoding 解压
+      let bodyStream = makeBodyStream(tlsReader, shape, () => {
         try {
           tls.close();
         } catch {
           // ignore
         }
       });
+      bodyStream = applyContentDecoding(rh.headers, bodyStream);
+      outHeaders.delete("content-encoding"); // outHeaders 已先于解码拷贝，同步移除避免矛盾头
       return new Response(bodyStream, { status: rh.status, statusText: rh.reason, headers: outHeaders });
     }
-    const full = await readFullBody(tlsReader, shape);
+    let full = await readFullBody(tlsReader, shape);
+    const contentEncoding = (rh.headers["content-encoding"] || "").trim().toLowerCase();
+    if (contentEncoding === "gzip" || contentEncoding === "deflate") {
+      delete rh.headers["content-encoding"];
+      outHeaders.delete("content-encoding");
+      full = await decodeFullBodyBytes(full, contentEncoding);
+    }
     tls.close();
     return new Response(full, { status: rh.status, statusText: rh.reason, headers: outHeaders });
   } catch (err) {

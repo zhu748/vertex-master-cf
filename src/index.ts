@@ -64,7 +64,7 @@ import { withFakeVariants } from "./fakestream.ts";
 //   - 拒绝示例密钥 sk-your-key-here（对齐 Go withAPIKey）；
 //   - 并发闸门仅作用于出站端点（对齐 Go isUpstreamWorkloadPath：模型列表/详情不占名额）；
 //   - Images n 张有界并发生成（滑动窗口 concurrency=3，n=8 延迟从 8x 降至 ⌈8/3⌉x）。
-const VERSION = "1.5.2";
+const VERSION = "1.5.3";
 
 function corsHeaders(): Record<string, string> {
   return {

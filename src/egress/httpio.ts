@@ -327,3 +327,43 @@ export async function readFullBody(reader: ByteBufReader, shape: BodyShape, limi
 }
 
 export { CRLF };
+
+// ---------- v1.5.3：Content-Encoding 解压（隧道 HTTP 客户端配套） ----------
+
+/**
+ * 响应体 Content-Encoding 解压 —— Go 版隐式依赖 bogdanfinn/tls-client 的
+ * 「自动透明解压 gzip/deflate/br」能力，CF 移植的自定义隧道 HTTP 客户端
+ * 此前完全缺失这层：请求头声明 accept-encoding 后，Google 返回 gzip 压缩体，
+ * token 抠取 / JSON 解析拿到的全是二进制垃圾（线上实测 anchor 响应体
+ * 以 gzip magic 1f 8b 开头、token regex 必然失配）。
+ *
+ * Workers/Node 的 DecompressionStream 仅支持 gzip / deflate（无 br）——
+ * 因此隧道请求头同步改为只声明 gzip（见 payload.ts）；不支持的编码
+ * 原样透传且保留响应头（语义一致：调用方看到的是未解压字节）。
+ *
+ * 解压成功时从 headers 记录中移除 content-encoding（调用方拷贝响应头时
+ * 不会带上「已解压却仍声明 gzip」的矛盾头）。
+ */
+export function applyContentDecoding(
+  headers: Record<string, string>,
+  body: ReadableStream<Uint8Array>,
+): ReadableStream<Uint8Array> {
+  const enc = (headers["content-encoding"] || "").trim().toLowerCase();
+  if (enc !== "gzip" && enc !== "deflate") return body;
+  delete headers["content-encoding"];
+  return body.pipeThrough(new DecompressionStream(enc));
+}
+
+/** 整读字节的解压版（非流式路径配套；编码不支持时原样返回） */
+export async function decodeFullBodyBytes(body: Uint8Array, encoding: string): Promise<Uint8Array> {
+  const enc = (encoding || "").trim().toLowerCase();
+  if (enc !== "gzip" && enc !== "deflate") return body;
+  const source = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(body);
+      controller.close();
+    },
+  });
+  const stream = source.pipeThrough(new DecompressionStream(enc));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}

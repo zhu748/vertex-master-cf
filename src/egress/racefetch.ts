@@ -58,6 +58,7 @@ import { ByteBufReader } from "./byteio.ts";
 import { acquireWithSweep as acquireWarm, discard, isWarm, release, type PooledConn } from "./connpool.ts";
 import { proxyHandshake, type ProxyEndpoint, type Tunnel } from "./handshake.ts";
 import {
+  applyContentDecoding,
   determineBodyShape,
   isBodylessStatus,
   makeBodyStream,
@@ -129,13 +130,6 @@ async function sendRequestOnConn(
       ? { chunked: false, contentLength: 0 }
       : determineBodyShape(head.headers);
     const allowsReuse = responseAllowsReuse(head) && (shape.chunked || shape.contentLength !== null);
-    const outHeaders = new Headers();
-    for (const [k, v] of Object.entries(head.headers)) {
-      if (["content-length", "transfer-encoding", "connection", "keep-alive", "proxy-connection"].includes(k)) continue;
-      outHeaders.set(k, v);
-    }
-    outHeaders.set("x-vproxy-conn", warm ? "warm" : "cold");
-
     let settled = false; // finish/cancel 双重触发防护
     const cleanup = (bodyReusable: boolean) => {
       if (settled) return;
@@ -144,7 +138,16 @@ async function sendRequestOnConn(
       const reusable = bodyReusable && allowsReuse && !signal?.aborted;
       release(conn, reusable);
     };
-    const body = makeBodyStream(reader, shape, cleanup);
+    let body = makeBodyStream(reader, shape, cleanup);
+    // v1.5.3：Content-Encoding 解压（先于响应头拷贝 —— 同时从 head.headers
+    // 移除 content-encoding，outHeaders 不会携带矛盾头）
+    body = applyContentDecoding(head.headers, body);
+    const outHeaders = new Headers();
+    for (const [k, v] of Object.entries(head.headers)) {
+      if (["content-length", "transfer-encoding", "connection", "keep-alive", "proxy-connection"].includes(k)) continue;
+      outHeaders.set(k, v);
+    }
+    outHeaders.set("x-vproxy-conn", warm ? "warm" : "cold");
     return new Response(body, { status: head.status, statusText: head.reason, headers: outHeaders });
   } catch (err) {
     signal?.removeEventListener("abort", onTlsAbort);

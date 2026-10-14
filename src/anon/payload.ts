@@ -251,7 +251,10 @@ export function xhrHeaders(
     "sec-fetch-mode": "cors",
     "sec-fetch-dest": "empty",
     referer,
-    "accept-encoding": "gzip, deflate, br",
+    // v1.5.3 CF 适配：Go 版 tls-client 自动透明解压 gzip/deflate/br，而
+    // Workers DecompressionStream 仅支持 gzip/deflate —— 只声明可解码的编码，
+    // 避免 br 压缩体无法解压（egress 层已配套 applyContentDecoding）。
+    "accept-encoding": "gzip",
     "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
     priority: "u=1, i",
   };
@@ -283,7 +286,7 @@ export function anchorHeaders(): Record<string, string> {
     "sec-fetch-site": "cross-site",
     "sec-fetch-mode": "navigate",
     "sec-fetch-dest": "iframe",
-    "accept-encoding": "gzip, deflate, br",
+    "accept-encoding": "gzip",
     "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
   };
 }

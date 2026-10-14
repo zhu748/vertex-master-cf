@@ -4,8 +4,14 @@
 > **Cloudflare Workers（official 模式免费计划即可；anon + 代理池建议 Workers Standard）**。在 cf-vproxy
 > （同作者的 official 模式 Workers 精简版）基础上，**补齐了 anon 匿名端点模式**，并把出站代理层按其
 > 设计重写（`cloudflare:sockets` 隧道 + 纯 JS TLS 1.3 + 连接复用池 + 订阅拉取 + 对冲竞速）。
-> 当前版本 **v1.5.2**（**重大根因修复**：代理隧道 TLS 应用数据接线 ——
-> 此前 TLS 握手后向裸隧道写明文 HTTP，服务端必然断连，Workers 代理路径 100% 失败）。
+> 当前版本 **v1.5.3**（Content-Encoding 解压 + TLS 应用数据接线 + verify-fail
+> 同 token 重试 + in-band 429 整轮换点重试 —— 代理隧道链路三层根因全部修复）。
+>
+> v1.5.3 变更（相对 v1.5.2）：
+>
+> | 改动 | 说明 |
+> |------|------|
+> | **Content-Encoding 解压** | Go 版隐式依赖 bogdanfinn/tls-client 的「自动透明解压 gzip/deflate/br」，CF 移植的隧道 HTTP 客户端此前完全缺失这层：请求头声明 `accept-encoding` 后 Google 返回 gzip 压缩体，token 抠取/JSON 解析拿到的全是二进制垃圾（线上实测 anchor 响应以 gzip magic `1f 8b` 开头）。新增 `applyContentDecoding`/`decodeFullBodyBytes`（`DecompressionStream`），流式与整读两路径均接入，解压后同步移除响应头避免矛盾。Workers `DecompressionStream` 不支持 br → 隧道请求头改为只声明 `gzip`（Go 版头部值的 CF 适配） |
 >
 > v1.5.2 变更（相对 v1.5.1）：
 >
