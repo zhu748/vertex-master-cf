@@ -642,7 +642,9 @@ export function retryDelayMs(retryAfterHeader: string | null | undefined, nowMs:
 const HEALTH_KEY = "proxy_health";
 const HEALTH_FLUSH_MS = 20_000;
 const HEALTH_TTL_SEC = 24 * 3600; // 快照新鲜度：超过一天的记录直接丢弃
-const HEALTH_MAX_NODES = 200;
+const HEALTH_MAX_NODES = 600; // v1.6.3：200 → 600 —— 531 节点订阅池此前只加载
+// 前 200 个（28 个双主机验证活节点每个 isolate 仅见 ~10 个，轮转池被砍半再
+// 砍半）；600 覆盖全池，内存成本 ~100KB（Workers 128MB 限额内可忽略）。
 
 const healthMem = new Map<string, ProxyHealth>();
 let healthLoaded = false;
