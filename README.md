@@ -4,8 +4,16 @@
 > **Cloudflare Workers（official 模式免费计划即可；anon + 代理池建议 Workers Standard）**。在 cf-vproxy
 > （同作者的 official 模式 Workers 精简版）基础上，**补齐了 anon 匿名端点模式**，并把出站代理层按其
 > 设计重写（`cloudflare:sockets` 隧道 + 纯 JS TLS 1.3 + 连接复用池 + 订阅拉取 + 对冲竞速）。
-> 当前版本 **v1.4.0**（整轮 429 多轮重试：多节点竞速遇到限流耗尽后等窗口恢复再战，
-> 全轮耗尽才直连兜底）。
+> 当前版本 **v1.4.1**（修复：anon 路径冷启动不载入健康快照，导致候选按订阅原始顺序接力、
+> 坏代理全部撞墙；现三个 anon 入口均先加载 KV 健康表再选点）。
+>
+> v1.4.1 变更（相对 v1.4.0）：
+>
+> | 改动 | 说明 |
+> |------|------|
+> | **anon 冷启动选点修复** | `callAnonGenerate` / `callAnonStream` / `callAnonCountTokens` 入口先 `ensureHealthLoaded` 载入 KV 健康快照再 `orderedCandidates` 选候选 —— 此前仅竞速路径（`dispatchUpstream`）加载，anon 冷启动 isolate 内存健康表为空，所有节点按「未测试 80 分」以订阅原始顺序接力，前部的坏代理（CONNECT 403/405/断连）全部撞墙也轮不到已验证好节点 |
+> | **anon 健康学习落盘** | 请求尾部追加 `flushHealthIfDue` 刷盘（与用量/指标同批）—— 此前 anon 路径记录的节点健康只能靠 15 分钟一次的 cron 落盘，跨 isolate 生效慢 |
+> | `callAnonStream` 改 async | 签名变为 `Promise<Response>`，调用方 `await` 适配 |
 >
 > v1.4.0 变更（相对 v1.3.0）：
 >

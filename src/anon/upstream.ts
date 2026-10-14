@@ -22,7 +22,7 @@ import { ByteBufReader } from "../egress/byteio.ts";
 import { proxyHandshake } from "../egress/handshake.ts";
 import { determineBodyShape, isBodylessStatus, makeBodyStream, parseResponseHeadBlock, readFullBody } from "../egress/httpio.ts";
 import { Tls13Client, invalidateSessionTicket } from "../egress/tls13.ts";
-import { classify429Body, recordProxyFailure, recordProxyRateLimit, recordProxySuccess } from "../racing.ts";
+import { classify429Body, ensureHealthLoaded, recordProxyFailure, recordProxyRateLimit, recordProxySuccess } from "../racing.ts";
 import { fetchRecaptchaToken } from "./recaptcha.ts";
 import {
   anonHeaders,
@@ -330,6 +330,10 @@ export async function callAnonGenerate(
   geminiPayload: Record<string, unknown>,
   signal?: AbortSignal,
 ): Promise<Response> {
+  // v1.4.1：冷启动 isolate 必须先载入 KV 健康快照再选候选 —— 此前 anon 路径
+  // 不加载，内存健康表为空 → 所有节点按「未测试 80 分」以订阅原始顺序接力，
+  // 前部的坏代理（CONNECT 403/405/断连）全部撞墙也轮不到已验证好节点。
+  await ensureHealthLoaded(ctx.env);
   const cfg = ctx.cfg;
   const params: ChatParams = {
     model,
@@ -365,7 +369,9 @@ export async function callAnonGenerate(
 }
 
 /** anon 模式流式 chat（streamGenerateContent）：合成 Gemini 原生 SSE 流 */
-export function callAnonStream(ctx: HandlerCtx, model: string, geminiPayload: Record<string, unknown>): Response {
+export async function callAnonStream(ctx: HandlerCtx, model: string, geminiPayload: Record<string, unknown>): Promise<Response> {
+  // v1.4.1：同 callAnonGenerate —— 流式路径也先载入健康快照（含冷启动场景）
+  await ensureHealthLoaded(ctx.env);
   const cfg = ctx.cfg;
   const params: ChatParams = {
     model,
@@ -472,6 +478,8 @@ export async function callAnonCountTokens(
   contents: unknown,
   signal?: AbortSignal,
 ): Promise<Response> {
+  // v1.4.1：同上 —— countTokens 接力也先载入健康快照
+  await ensureHealthLoaded(ctx.env);
   const overrides = anonOverrides(ctx.cfg);
   await ensureBrowserValidation();
   const url = batchGraphqlURL(overrides);

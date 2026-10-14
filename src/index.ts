@@ -44,6 +44,7 @@ import { loadConfig } from "./config.ts";
 import { resolveProxyPool, type ProxyPool } from "./egress/pool.ts";
 import { loadActiveModels, listChatModels, geminiModelInfo, isKnownModelActive } from "./modellist.ts";
 import { flushIfDue } from "./usage.ts";
+import { flushHealthIfDue } from "./racing.ts";
 import { flushMetricsIfDue, metricsBegin, metricsFinish } from "./metrics.ts";
 import { runScheduledTasks } from "./cron.ts";
 import { maskClientKey, protocolOf, pushLog } from "./logs.ts";
@@ -63,7 +64,7 @@ import { withFakeVariants } from "./fakestream.ts";
 //   - 拒绝示例密钥 sk-your-key-here（对齐 Go withAPIKey）；
 //   - 并发闸门仅作用于出站端点（对齐 Go isUpstreamWorkloadPath：模型列表/详情不占名额）；
 //   - Images n 张有界并发生成（滑动窗口 concurrency=3，n=8 延迟从 8x 降至 ⌈8/3⌉x）。
-const VERSION = "1.4.0";
+const VERSION = "1.4.1";
 
 function corsHeaders(): Record<string, string> {
   return {
@@ -176,6 +177,9 @@ export default {
       // 刷盘（用量/指标）均为 25s 批量合并 + 内部吞错；这里再加防御性 catch，
       // 保证 waitUntil 拒绝不会以未处理异常形式出现在平台日志里
       ctx.waitUntil(flushIfDue(env).catch(() => {}));
+      // v1.4.1：anon 路径学习的节点健康也随请求尾部刷盘（此前仅竞速路径刷，
+      // anon 的学习结果只能靠 15 分钟一次的 cron 落盘）
+      ctx.waitUntil(flushHealthIfDue(env).catch(() => {}));
       ctx.waitUntil(flushMetricsIfDue(env).catch(() => {}));
       metricsFinish(resp.status, Date.now() - started, protocolOf(url.pathname));
       pushLog({

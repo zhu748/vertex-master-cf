@@ -11,18 +11,17 @@
   "observability": {
     "enabled": true
   },
-  // ⚠️ 部署前必须：先 `wrangler kv namespace create VPROXY_KV`，
-  // 然后把下面 id 换成命令输出的真实 id
+  // KV：账号内已创建的 VPROXY_KV namespace（与旧部署共用，保留健康数据/代理缓存）
   "kv_namespaces": [
     {
       "binding": "VPROXY_KV",
-      "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+      "id": "8e66284fae7b498baf84bd8c7f769963"
     }
   ],
-  // 自定义域名（可选）：Cloudflare 会自动创建 DNS 记录与证书
-  // "routes": [
-  //   { "pattern": "your-domain.example.com", "custom_domain": true }
-  // ],
+  // 自定义域名（zone 051246.xyz 需在同一账号；Cloudflare 自动建 DNS 记录与证书）
+  "routes": [
+    { "pattern": "hjm.051246.xyz", "custom_domain": true }
+  ],
   // 非敏感配置可以放 vars（敏感的一律用 `wrangler secret put`）
   "vars": {},
   // Smart Placement —— 把 Worker 执行位置迁移到后端（Google API）附近运行。

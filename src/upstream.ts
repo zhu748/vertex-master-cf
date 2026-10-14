@@ -117,7 +117,8 @@ async function callAnon(ctx: HandlerCtx, model: string, action: string, bodyText
     case "generateContent":
       return await callAnonGenerate(ctx, model, payload);
     case "streamGenerateContent":
-      return callAnonStream(ctx, model, payload);
+      // v1.4.1：callAnonStream 已改为 async（先载入健康快照再选候选）
+      return await callAnonStream(ctx, model, payload);
     case "countTokens": {
       const unwrapped = unwrapCountTokensBody(payload);
       return await callAnonCountTokens(ctx, model, unwrapped.contents);
