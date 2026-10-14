@@ -74,8 +74,12 @@ export async function* normalizeNativeStreamFrames(
   let lastTokenCount = 0;
   let usage: GResponse["usageMetadata"] | undefined;
   let sawFinish = false;
+  let sawError = false; // v1.6.4：带内错误帧（anon 终局）是流的终止信号，不应再补 STOP
 
   for await (const raw of frames) {
+    // v1.6.4：错误帧（{error:{code,...}}）原样透传，并终止补帧逻辑 ——
+    // 旧实现在其后追加合成 STOP 帧，客户端把 429 限流当成「正常完成、内容为空」
+    if ((raw as { error?: unknown }).error) sawError = true;
     const frame: GResponse = normalizeGeminiResponse(raw);
 
     // 记录 token 兜底（usage-only 帧或任意帧都可能是 tokenCount 形态）
@@ -111,8 +115,8 @@ export async function* normalizeNativeStreamFrames(
     return;
   }
 
-  if (!sawFinish) {
-    // 补合成 STOP 帧（带 usage）
+  if (!sawFinish && !sawError) {
+    // 补合成 STOP 帧（带 usage）—— v1.6.4：错误帧后不补（错误即终局）
     const finalFrame: GResponse = {
       candidates: [{ content: { role: "model", parts: [] }, finishReason: "STOP", index: 0 }],
     };

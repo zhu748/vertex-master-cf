@@ -1,6 +1,6 @@
 {
   "name": "vertex-master-cf",
-  "version": "1.6.3",
+  "version": "1.6.4",
   "description": "Vertex Master 全功能 Cloudflare Workers 版 —— anon 匿名端点（reCAPTCHA 现抓）+ official 单 Key 直连双通道，四协议转换（OpenAI/Responses/Anthropic/Gemini）+ SOCKS4/5/HTTP 出站代理 + 对冲竞速 + Web 管理面板",
   "private": true,
   "type": "module",

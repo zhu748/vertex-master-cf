@@ -4,8 +4,14 @@
 > **Cloudflare Workers（official 模式免费计划即可；anon + 代理池建议 Workers Standard）**。在 cf-vproxy
 > （同作者的 official 模式 Workers 精简版）基础上，**补齐了 anon 匿名端点模式**，并把出站代理层按其
 > 设计重写（`cloudflare:sockets` 隧道 + 纯 JS TLS 1.3 + 连接复用池 + 订阅拉取 + 对冲竞速）。
-> 当前版本 **v1.5.4**（Content-Encoding 解压 + TLS 应用数据接线 + verify-fail
-> 同 token 重试 + in-band 429 处理 + 候选并发竞速 —— 代理隧道链路多层根因全部修复）。
+> 当前版本 **v1.6.4**（流式「空回且无报错」根因修复：anon 竞速预冲 + 错误帧
+> 语义透传 —— 全池 429 时客户端拿到真实 HTTP 429，而非 200 空流）。
+>
+> v1.6.4 变更（相对 v1.6.3）：
+>
+> | 改动 | 说明 |
+> |------|------|
+> | **流式空回无报错（根因）** | 线上实测（面板日志 `streamGenerateContent 200 0ms`）：anon 全池 429 时旧实现返回 200 + 懒流，流内发带内错误帧后 `geminihygiene` 因「未见 finishReason」又追加合成 STOP 帧 —— Gemini/OpenAI/Anthropic 三协议客户端一律解读为「正常完成、内容为空」，429 被完全掩盖。修复①`callAnonStream` 竞速预冲：200 只在拿到首个内容帧后发出，无内容终局以真实 HTTP 429/401/403/502 返回（三协议处理器的 `!upstream.ok` 分支接住后给客户端原生错误结构，可显示可重试）；②`normalizeNativeStreamFrames`：错误帧即终局，其后不再追加合成 STOP。纯逻辑沉淀 `anon/streambridge.ts`（事件桥 + 终局渲染，Node 单测覆盖）；另修复 pull 空返回停摆问题（Streams 规范：pull 兑现未入队不自动重拉，改 for(;;) 内循环跳空帧） |
 >
 > v1.5.4 变更（相对 v1.5.3）：
 >

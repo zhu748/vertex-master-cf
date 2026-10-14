@@ -40,6 +40,13 @@ import {
   processStreamingObject,
   scanJsonObjects,
 } from "./streamparse.ts";
+import {
+  bridgeToSseResponse,
+  type ChatRaceResult,
+  createRaceBridge,
+  noContentErrorResponse,
+  terminalResponse,
+} from "./streambridge.ts";
 
 const ANON_MAX_CANDIDATES = 3; // 单轮最多并行候选数（Workers 同时连接上限 6：
 // 3 活跃 GraphQL 隧道 + ≤3 条池内 keep-alive 空闲 recaptcha 隧道 ≈ 6，再加宽会撞限）
@@ -404,12 +411,12 @@ function anonCandidates(pool: ProxyPool | null): Array<ProxyEntry | null> {
   return [null];
 }
 
-/** chat 竞速终局：ok = 已有内容经 emit 流出（lastTerminal 为内容后错误） */
-interface ChatRaceResult {
-  ok: boolean;
-  lastTerminal: AnonUpstreamError | null;
-  last429: AnonUpstreamError | null;
-}
+/** chat 竞速终局：ok = 已有内容经 emit 流出（lastTerminal 为内容后错误）。
+ *  v1.6.4：定义移入 streambridge.ts（纯逻辑，Node 单测可导入），此处 re-export。 */
+export type { ChatRaceResult } from "./streambridge.ts";
+
+/** v1.6.4：竞速注入签名（生产用 raceChatCandidates，单测可注入桩） */
+export type RaceChatFn = typeof raceChatCandidates;
 
 /** v1.6.0：整场竞速墙钟上限（内容前阶段的总帽子）——4 轮 × 22s 单轮截止
  *  叠加最坏 ~88s，会逼近 CF 代理 ~100s 首字节超时；总上限硬性钳制 60s，
@@ -522,19 +529,6 @@ async function raceChatCandidates(
   return { ok: false, lastTerminal, last429 };
 }
 
-function terminalResponse(err: AnonUpstreamError): Response {
-  const status = err.status >= 400 && err.status <= 599 ? err.status : 502;
-  const geminiStatus =
-    status === 401 || status === 403
-      ? "UNAUTHENTICATED"
-      : status === 429
-        ? "RESOURCE_EXHAUSTED"
-        : status >= 500
-          ? "UNAVAILABLE"
-          : "INVALID_ARGUMENT";
-  return errGemini(status, err.message || "anon upstream error", geminiStatus);
-}
-
 /** anon 模式非流式 chat（generateContent / predict 类）：聚合为单个 Gemini 响应。
  *  v1.5.4：候选并发竞速（raceChatCandidates）—— 首个产出内容的候选胜出，
  *  其余立即中止；全池 429 时快速换轮，耗尽返回 429（而非 502）。 */
@@ -579,10 +573,20 @@ export async function callAnonGenerate(
 }
 
 /** anon 模式流式 chat（streamGenerateContent）：合成 Gemini 原生 SSE 流。
- *  v1.5.4：候选并发竞速 + 推送式 ReadableStream —— 首个产出内容的候选胜出
- *  （其 chunk 实时入队），其余候选立即中止；全池 429 快速换轮，耗尽发送
- *  429 错误帧（保留限流语义）后收流。 */
-export async function callAnonStream(ctx: HandlerCtx, model: string, geminiPayload: Record<string, unknown>): Promise<Response> {
+ *  v1.5.4：候选并发竞速 —— 首个产出内容的候选胜出，其余立即中止。
+ *  v1.6.4（根因修复「空式空回且无报错」）：竞速预冲 —— 200 状态码只在拿到
+ *  首个内容帧后才发出；全池耗尽（429/401/403/502）以真实 HTTP 错误返回，
+ *  三个协议处理器（gemini/openai/anthropic）的 !upstream.ok 分支接住后
+ *  给客户端原生错误结构，可显示可重试。旧实现立即返回 200 + 懒流，
+ *  带内错误帧被 geminihygiene 追加的合成 STOP 帧掩盖，客户端一律呈现为
+ *  「空回复且无错误」（线上实测：error 帧后紧跟 STOP 帧）。
+ *  桥/渲染纯逻辑在 streambridge.ts（Node 单测覆盖）。 */
+export async function callAnonStream(
+  ctx: HandlerCtx,
+  model: string,
+  geminiPayload: Record<string, unknown>,
+  raceFn: RaceChatFn = raceChatCandidates,
+): Promise<Response> {
   // v1.4.1：同 callAnonGenerate —— 流式路径也先载入健康快照（含冷启动场景）
   await ensureHealthLoaded(ctx.env);
   const cfg = ctx.cfg;
@@ -594,68 +598,35 @@ export async function callAnonStream(ctx: HandlerCtx, model: string, geminiPaylo
     url: batchGraphqlURL(anonOverrides(cfg)),
     safetySettingsMap: cfg.safety_settings,
   };
-  const encoder = new TextEncoder();
   const abort = new AbortController();
+  const bridge = createRaceBridge();
 
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      try {
-        const result = await raceChatCandidates(
-          ctx,
-          params,
-          (chunk) => {
-            if (Object.keys(chunk).length === 0) return true;
-            controller.enqueue(encoder.encode("data: " + JSON.stringify(chunk) + "\n\n"));
-            return true;
-          },
-          abort.signal,
-        );
-        if (result.ok) {
-          if (result.lastTerminal) {
-            // 已产出内容后的错误：作为终止帧
-            controller.enqueue(encoder.encode("data: " + JSON.stringify({ error: terminalErrorBody(result.lastTerminal) }) + "\n\n"));
-          }
-          controller.close();
-          return;
-        }
-        // 无内容终局：401/403/429 语义透传，其余 502
-        const terminal = result.lastTerminal;
-        if (terminal && (terminal.status === 401 || terminal.status === 403 || terminal.status === 429)) {
-          controller.enqueue(encoder.encode("data: " + JSON.stringify({ error: terminalErrorBody(terminal) }) + "\n\n"));
-        } else if (result.last429) {
-          const err = new AnonUpstreamError(429, result.last429.body, "anon rate limited: all candidates exhausted (429)");
-          controller.enqueue(encoder.encode("data: " + JSON.stringify({ error: terminalErrorBody(err) }) + "\n\n"));
-        } else {
-          controller.enqueue(
-            encoder.encode("data: " + JSON.stringify({ error: { code: 502, message: "anon upstream failed: all candidates exhausted", status: "UNAVAILABLE" } }) + "\n\n"),
-          );
-        }
-        controller.close();
-      } catch (err) {
-        controller.error(err);
-      }
+  // 竞速后台起跑：chunk → 桥；终局（含异常兑底 502）→ 桥。catch 在前保证
+  // 链路必达 done 事件（不留未处理 rejection）。
+  void raceFn(
+    ctx,
+    params,
+    (chunk) => {
+      bridge.push({ chunk });
+      return true;
     },
-    cancel() {
-      abort.abort();
-    },
-  });
-  return new Response(stream, {
-    status: 200,
-    headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
-  });
-}
+    abort.signal,
+  )
+    .catch((e): ChatRaceResult => ({
+      ok: false,
+      lastTerminal: new AnonUpstreamError(502, "", "anon race crashed: " + (e instanceof Error ? e.message : String(e))),
+      last429: null,
+    }))
+    .then((done) => {
+      bridge.push({ done });
+    });
 
-function terminalErrorBody(err: AnonUpstreamError): Record<string, unknown> {
-  const status = err.status >= 400 && err.status <= 599 ? err.status : 502;
-  const geminiStatus =
-    status === 401 || status === 403
-      ? "UNAUTHENTICATED"
-      : status === 429
-        ? "RESOURCE_EXHAUSTED"
-        : status >= 500
-          ? "UNAVAILABLE"
-          : "INVALID_ARGUMENT";
-  return { code: status, message: err.message || "anon upstream error", status: geminiStatus };
+  // —— 预冲：等首个事件决定状态码（内容帧 → 200；终局 → 真实 HTTP 错误）——
+  const first = await bridge.take();
+  if (first.done) return noContentErrorResponse(first.done);
+
+  // —— 已有内容：200 + 剩余事件渲染为 SSE（含内容后终止帧）——
+  return bridgeToSseResponse(bridge, abort);
 }
 
 /** anon 模式 countTokens：CountTokens 操作 → {totalTokens}。
