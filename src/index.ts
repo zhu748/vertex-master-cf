@@ -42,7 +42,7 @@ import { json, protocolErrorResponse, tokensEqual } from "./convert/common.ts";
 import type { Env } from "./config.ts";
 import { loadConfig } from "./config.ts";
 import { resolveProxyPool, type ProxyPool } from "./egress/pool.ts";
-import { loadActiveModels, listChatModels } from "./modellist.ts";
+import { loadActiveModels, listChatModels, geminiModelInfo, isKnownModelActive } from "./modellist.ts";
 import { flushIfDue } from "./usage.ts";
 import { flushMetricsIfDue, metricsBegin, metricsFinish } from "./metrics.ts";
 import { runScheduledTasks } from "./cron.ts";
@@ -52,7 +52,12 @@ import { matchApiRoute, NEEDS_UPSTREAM, type ApiRoute } from "./router.ts";
 import { acquireSlot, bodyLimitViolation } from "./gate.ts";
 import { withFakeVariants } from "./fakestream.ts";
 
-const VERSION = "1.1.0";
+// v1.2.0 —— 补齐原项目遗漏端点（逐行比对 Go 版 server.go 路由表）：
+//   - GET /health（/healthz 别名）、GET|HEAD /keepalive、GET|HEAD /api/hello（Claude Code
+//     网关探测）、GET /favicon.ico —— 均为鉴权豁免（对齐 Go 版 withAPIKey excluded 表）；
+//   - GET /v1beta/models/{model}（Gemini 格式模型详情，原项目 handleModelInfo）；
+//   - safety_settings 配置 + normalizeSafetySettings 归一化（Go 版 BuildVertexVariables 语义）。
+const VERSION = "1.2.0";
 
 function corsHeaders(): Record<string, string> {
   return {
@@ -117,7 +122,11 @@ function serviceInfo(): Response {
         "POST /v1/images/variations",
       ],
       anthropic: ["POST /v1/messages", "POST /v1/messages/count_tokens"],
-      gemini: ["GET /v1beta/models", "POST /v1beta/models/{model}:{generateContent|streamGenerateContent|countTokens|predict|predictLongRunning}"],
+      gemini: [
+        "GET /v1beta/models",
+        "GET /v1beta/models/{model}",
+        "POST /v1beta/models/{model}:{generateContent|streamGenerateContent|countTokens|predict|predictLongRunning}",
+      ],
       admin: [
         "GET /admin (Web 面板)",
         "GET|POST /admin/config",
@@ -141,6 +150,7 @@ function serviceInfo(): Response {
       ],
     },
     outbound_proxies: ["socks4://", "socks4a://", "socks5://", "http://"],
+    probes: ["GET /health", "GET /healthz", "GET /readyz", "GET|HEAD /keepalive", "GET|HEAD /api/hello"],
     proxy_notes: "https:// 代理在 Workers 上不可用（无法 TLS-in-TLS），配置与订阅中的此类链接会被自动剔除",
   });
 }
@@ -208,7 +218,21 @@ async function route(req: Request, env: Env, ctx: ExecutionContext): Promise<Res
   const path = url.pathname.replace(/\/+$/, "") || "/";
 
   if (req.method === "GET" && (path === "/" || path === "")) return serviceInfo();
-  if (req.method === "GET" && (path === "/healthz" || path === "/readyz")) return json({ ok: true, version: VERSION });
+  if (req.method === "GET" && (path === "/healthz" || path === "/readyz" || path === "/health"))
+    return json({ ok: true, version: VERSION });
+
+  // ===== 鉴权豁免探测端点（对齐 Go 版 withAPIKey excluded 表）=====
+  if (path === "/keepalive") {
+    if (req.method !== "GET" && req.method !== "HEAD") return new Response(null, { status: 405, headers: { Allow: "GET, HEAD" } });
+    return new Response(null, { status: 200 });
+  }
+  if (path === "/api/hello") {
+    // Claude Code 启动时对自定义 LLM gateway 的轻量探测（原项目 handleAnthropicHello）
+    if (req.method === "HEAD") return new Response(null, { status: 200 });
+    if (req.method !== "GET") return new Response(null, { status: 405, headers: { Allow: "GET, HEAD" } });
+    return json({ status: "ok" });
+  }
+  if (path === "/favicon.ico") return new Response(null, { status: 204 });
 
   // ===== 管理端点（面板 HTML 无需 token，API 走 ADMIN_TOKEN） =====
   if (path.startsWith("/admin")) {
@@ -330,6 +354,16 @@ async function route(req: Request, env: Env, ctx: ExecutionContext): Promise<Res
       // ---- Gemini 原生 ----
       case "gemini_list_models":
         return handleGeminiListModels();
+      case "gemini_model_detail": {
+        // 原项目 handleModelInfo：未知名 404 Gemini 错误结构；已知名返回详情
+        const rawId = routeInfo.model ?? "";
+        const bare = rawId.replace(/^models\//, "");
+        const known = isKnownModelActive(bare) || withFakeVariants(listChatModels()).includes(bare);
+        if (!known) {
+          return json({ error: { code: 404, message: "Model '" + rawId + "' not found.", status: "NOT_FOUND" } }, 404);
+        }
+        return json(geminiModelInfo(bare));
+      }
       case "gemini_native":
         return await handleGeminiNative(routeInfo.model ?? "", routeInfo.action ?? "", req, hctx);
       }

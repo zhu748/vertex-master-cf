@@ -66,7 +66,22 @@ export function defaultConfig(env: Env): VProxyConfig {
     keepalive_url: "",
     keepalive_interval: 60,
     claude_prompt: { ...DEFAULT_CLAUDE_PROMPT_POLICY, replacements: [] },
+    safety_settings: {},
   };
+}
+
+/** safety_settings 清洗：HARM_CATEGORY_* 键 + 非空阈值字符串（≤64 字符），上限 16 条 */
+function sanitizeSafetySettings(raw: unknown): Record<string, string> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (!k.startsWith("HARM_CATEGORY_") || typeof v !== "string") continue;
+    const threshold = v.trim();
+    if (!threshold || threshold.length > 64) continue;
+    out[k] = threshold;
+    if (Object.keys(out).length >= 16) break;
+  }
+  return out;
 }
 
 export function sanitizeApiMode(raw: unknown): ApiMode | null {
@@ -136,6 +151,8 @@ export function sanitizeConfig(raw: unknown): VProxyConfig {
     keepalive_url: typeof d.keepalive_url === "string" ? d.keepalive_url.trim() : "",
     keepalive_interval: clampNum(d.keepalive_interval, 60, 5, 86_400),
     claude_prompt: sanitizeClaudePromptPolicy(d.claude_prompt),
+    // safety_settings：仅接受 HARM_CATEGORY_* → 非空字符串（阈值），上限 16 类（对齐 Go 版上限语义）
+    safety_settings: sanitizeSafetySettings(d.safety_settings),
   };
 }
 

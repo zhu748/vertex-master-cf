@@ -265,4 +265,8 @@ export interface VProxyConfig {
   keepalive_interval: number;
   /** Claude 提示词策略（/v1/messages 与 count_tokens 生效） */
   claude_prompt: import("./promptpolicy.ts").ClaudePromptPolicy;
+  /** 安全阈值覆盖（原项目 safety_settings：HARM_CATEGORY_* → BLOCK_* 阈值）。
+   *  anon 请求的 safetySettings 归一化语义：客户端未提供/为空/含 UNSPECIFIED 时，
+   *  用此 map 逐类别填充（缺省类别 BLOCK_NONE），与 Go 版 normalizeSafetySettings 一致 */
+  safety_settings: Record<string, string>;
 }

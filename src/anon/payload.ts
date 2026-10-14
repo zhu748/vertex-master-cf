@@ -32,6 +32,48 @@ export const DEFAULT_SAFETY_SETTINGS = [
   { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "BLOCK_NONE" },
 ];
 
+// safetyCategories（Go 版 transform/request.go）：buildSafetySettingsFromMap 的固定类别顺序
+const SAFETY_CATEGORIES = [
+  "HARM_CATEGORY_HARASSMENT",
+  "HARM_CATEGORY_HATE_SPEECH",
+  "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+  "HARM_CATEGORY_DANGEROUS_CONTENT",
+  "HARM_CATEGORY_CIVIC_INTEGRITY",
+];
+
+/**
+ * normalizeSafetySettings（移植自 Go 版 transform/request_contents.go，BuildVertexVariables
+ * 在每个出站 chat 请求上无条件执行）—— 让原生 Gemini 请求与转换请求行为一致：
+ *   - 客户端提供了非空 safetySettings：逐项校验，阈值空/含 UNSPECIFIED →
+ *     BLOCK_NONE，配置了 safety_settings[category] 则用配置值；显式阈值原样保留；
+ *   - 未提供/为空/类型不对：按固定类别顺序用配置 map 填充（缺省 BLOCK_NONE）。
+ * 保存为单一事实源：converted OpenAI/Anthropic 请求不带 safetySettings，
+ * 归一化后同样恒携带 5 类阈值（与 Go 版出站 JSON 形态一致）。
+ */
+export function normalizeSafetySettings(raw: unknown, configured: Record<string, string>): Array<{ category: string; threshold: string }> {
+  if (Array.isArray(raw) && raw.length > 0) {
+    const out: Array<{ category: string; threshold: string }> = [];
+    for (const item of raw) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+      const category = String((item as Record<string, unknown>)["category"] ?? "").trim();
+      if (!category) continue;
+      let threshold = String((item as Record<string, unknown>)["threshold"] ?? "").trim().toUpperCase();
+      if (!threshold || threshold.includes("UNSPECIFIED")) {
+        threshold = "BLOCK_NONE";
+        const c = configured[category];
+        if (c) threshold = c;
+      }
+      out.push({ category, threshold });
+    }
+    return out;
+  }
+  // 缺失/为空：按固定类别顺序构建（配置 map 优先，否则 BLOCK_NONE）
+  return SAFETY_CATEGORIES.map((category) => ({
+    category,
+    threshold: configured[category] || "BLOCK_NONE",
+  }));
+}
+
 /** 从 geminiPayload 透传进 variables 的字段（camel/snake 别名，对齐 Go 版 supportedVarFields） */
 const SUPPORTED_VAR_FIELDS: Array<[string, string]> = [
   ["contents", "contents"],
@@ -59,7 +101,7 @@ export function parseModelName(model: string): string {
 export function buildVertexVariables(
   model: string,
   geminiPayload: Record<string, unknown>,
-  opts?: { dropMaxTokens?: boolean },
+  opts?: { dropMaxTokens?: boolean; safetySettingsMap?: Record<string, string> },
 ): Record<string, unknown> {
   const vars: Record<string, unknown> = {};
   vars["model"] = parseModelName(model);
@@ -67,6 +109,9 @@ export function buildVertexVariables(
     const value = camel in geminiPayload ? geminiPayload[camel] : snake in geminiPayload ? geminiPayload[snake] : undefined;
     if (value !== undefined) vars[camel] = value;
   }
+  // safetySettings 归一化（Go 版 BuildVertexVariables 无条件执行）：未提供时按
+  // 配置 map/BLOCK_NONE 默认填充 —— 每个出站请求恒携带 5 类阈值
+  vars["safetySettings"] = normalizeSafetySettings(vars["safetySettings"], opts?.safetySettingsMap ?? {});
   // systemInstruction：字符串/部分对象 → 标准 {parts:[...]} 形态
   const sys = vars["systemInstruction"];
   if (sys !== undefined) vars["systemInstruction"] = normalizeSystemInstruction(sys);
@@ -260,7 +305,7 @@ export function buildChatPayload(
   geminiPayload: Record<string, unknown>,
   recaptchaToken: string,
   overrides?: AnonOverrides,
-  opts?: { dropMaxTokens?: boolean; extraSafetySettings?: boolean },
+  opts?: { dropMaxTokens?: boolean; extraSafetySettings?: boolean; safetySettingsMap?: Record<string, string> },
 ): Record<string, unknown> {
   const vars = buildVertexVariables(model, geminiPayload, opts);
   if (opts?.extraSafetySettings && !vars["safetySettings"]) vars["safetySettings"] = DEFAULT_SAFETY_SETTINGS;

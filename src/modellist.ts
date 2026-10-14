@@ -134,6 +134,29 @@ export function activeSourceInfo(): { source: "builtin" | "official"; fetched_at
   return { source: t.source, fetched_at: t.fetched_at, total: t.chat.length + t.native_only.length, excluded: t.excluded.length };
 }
 
+/**
+ * Gemini 模型详情对象（移植 Go 版 internal/api/models.go geminiModelInfo，供
+ * GET /v1beta/models/{model} 返回）：真实元数据优先（动态表/内置表），缺失字段
+ * 用 Go 版同款占位默认值（1048576/65536 + 三方法列表）。
+ */
+export function geminiModelInfo(rawName: string): Record<string, unknown> {
+  const name = rawName.replace(/^models\//, "");
+  const meta = modelMeta(name);
+  const methods =
+    meta && Array.isArray(meta.methods) && meta.methods.length > 0
+      ? meta.methods
+      : ["generateContent", "streamGenerateContent", "countTokens"];
+  return {
+    name: "models/" + name,
+    version: meta?.version || name,
+    displayName: meta?.display_name || name,
+    description: meta?.description || "Vertex AI Studio anonymous model",
+    inputTokenLimit: meta?.input_token_limit ?? 1_048_576,
+    outputTokenLimit: meta?.output_token_limit ?? 65_536,
+    supportedGenerationMethods: methods,
+  };
+}
+
 // ---------- KV 持久化 ----------
 
 function dynamicToTable(d: StoredDynamic): ActiveModelTable | null {

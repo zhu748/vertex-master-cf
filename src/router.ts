@@ -18,6 +18,7 @@ export type ApiRouteKind =
   | "anthropic_messages" // POST /v1/messages
   | "anthropic_count_tokens" // POST /v1/messages/count_tokens
   | "gemini_list_models" // GET  /v1beta/models
+  | "gemini_model_detail" // GET  /v1beta/models/{model}（原项目 handleModelInfo）
   | "gemini_native" // POST /v1beta/models/{model}:{action}
   | "unknown";
 
@@ -43,6 +44,7 @@ export const NEEDS_UPSTREAM: ReadonlySet<ApiRouteKind> = new Set<ApiRouteKind>([
 ]);
 
 const GEMINI_ACTION_RE = /^\/v1beta\/models\/([^:]+):([a-zA-Z]+)$/;
+const GEMINI_MODEL_RE = /^\/v1beta\/models\/([^:]+)$/; // GET 详情：不含 :action（对齐 Go 版 handleModelsSubtree）
 const OPENAI_MODEL_RE = /^\/v1\/models\/([^\/]+)$/;
 
 /**
@@ -82,6 +84,10 @@ export function matchApiRoute(method: string, path: string): ApiRoute {
   }
 
   if (m === "GET" && path === "/v1beta/models") return { kind: "gemini_list_models" };
+  if (m === "GET") {
+    const g = GEMINI_MODEL_RE.exec(path);
+    if (g) return { kind: "gemini_model_detail", model: decodeURIComponent(g[1]) };
+  }
 
   return { kind: "unknown" };
 }

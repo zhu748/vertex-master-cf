@@ -54,6 +54,19 @@ test("router: Gemini 原生端点（模型名 + 动作）", () => {
   assert.equal(matchApiRoute("POST", "/v1beta/models/gemini-2.5-pro:not-an-action!").kind, "unknown");
 });
 
+test("router: v1.2.0 GET /v1beta/models/{model} 模型详情（对齐 Go 版 handleModelsSubtree）", () => {
+  const r = matchApiRoute("GET", "/v1beta/models/gemini-2.5-pro");
+  assert.equal(r.kind, "gemini_model_detail");
+  assert.equal(r.model, "gemini-2.5-pro");
+  // models/ 前缀同样匹配（Go 版在 handleModelInfo 内剥前缀）
+  const p = matchApiRoute("GET", "/v1beta/models/models/gemini-2.5-pro");
+  assert.equal(p.kind, "gemini_model_detail");
+  // 带冒号的 GET 不匹配详情（动作类端点仅 POST）
+  assert.equal(matchApiRoute("GET", "/v1beta/models/gemini-2.5-pro:generateContent").kind, "unknown");
+  // 详情端点不需要上游代理池
+  assert.ok(!NEEDS_UPSTREAM.has("gemini_model_detail"));
+});
+
 test("router: 未知路径 / 方法不匹配", () => {
   assert.equal(matchApiRoute("POST", "/v1/unknown").kind, "unknown");
   assert.equal(matchApiRoute("GET", "/v1/chat/completions").kind, "unknown");

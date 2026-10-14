@@ -155,6 +155,8 @@ interface ChatParams {
   dropMaxTokens: boolean;
   overrides: AnonOverrides;
   url: string;
+  /** safety_settings 配置（逐类别阈值覆盖，Go 版 cfg.SafetySettings() 语义） */
+  safetySettingsMap: Record<string, string>;
 }
 
 /**
@@ -191,6 +193,7 @@ async function runChatCandidate(
     }
     const payload = buildChatPayload(params.model, params.geminiPayload, token, params.overrides, {
       dropMaxTokens: params.dropMaxTokens,
+      safetySettingsMap: params.safetySettingsMap,
     });
     let resp: Response;
     try {
@@ -334,6 +337,7 @@ export async function callAnonGenerate(
     dropMaxTokens: cfg.drop_max_tokens,
     overrides: anonOverrides(cfg),
     url: batchGraphqlURL(anonOverrides(cfg)),
+    safetySettingsMap: cfg.safety_settings,
   };
   let lastTerminal: AnonUpstreamError | null = null;
   for (const p of anonCandidates(ctx.pool)) {
@@ -369,6 +373,7 @@ export function callAnonStream(ctx: HandlerCtx, model: string, geminiPayload: Re
     dropMaxTokens: cfg.drop_max_tokens,
     overrides: anonOverrides(cfg),
     url: batchGraphqlURL(anonOverrides(cfg)),
+    safetySettingsMap: cfg.safety_settings,
   };
   const candidates = anonCandidates(ctx.pool);
   const encoder = new TextEncoder();

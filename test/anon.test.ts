@@ -51,6 +51,48 @@ test("payload: dropMaxTokens 删除输出上限（对齐原项目语义）", () 
   assert.deepEqual(vars["generationConfig"], { temperature: 1 });
 });
 
+test("payload: safetySettings 归一化 —— 未提供时按固定 5 类填充 BLOCK_NONE", () => {
+  const vars = buildVertexVariables("gemini-3.6-flash", { contents: [] });
+  const ss = vars["safetySettings"] as Array<{ category: string; threshold: string }>;
+  assert.equal(ss.length, 5);
+  assert.deepEqual(
+    ss.map((s) => s.category),
+    [
+      "HARM_CATEGORY_HARASSMENT",
+      "HARM_CATEGORY_HATE_SPEECH",
+      "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+      "HARM_CATEGORY_DANGEROUS_CONTENT",
+      "HARM_CATEGORY_CIVIC_INTEGRITY",
+    ],
+  );
+  assert.ok(ss.every((s) => s.threshold === "BLOCK_NONE"));
+});
+
+test("payload: safetySettings 归一化 —— 配置 map 覆盖 + UNSPECIFIED 替换 + 显式阈值保留", () => {
+  const configured = { HARM_CATEGORY_HARASSMENT: "BLOCK_ONLY_HIGH", HARM_CATEGORY_HATE_SPEECH: "BLOCK_MEDIUM_AND_ABOVE" };
+  // 未提供 → 配置 map 填充，未配置类别回退 BLOCK_NONE
+  const vars = buildVertexVariables("gemini-3.6-flash", { contents: [] }, { safetySettingsMap: configured });
+  const ss = vars["safetySettings"] as Array<{ category: string; threshold: string }>;
+  assert.equal(ss[0].threshold, "BLOCK_ONLY_HIGH");
+  assert.equal(ss[1].threshold, "BLOCK_MEDIUM_AND_ABOVE");
+  assert.equal(ss[4].threshold, "BLOCK_NONE");
+  // 客户端提供：UNSPECIFIED 类阈值（含 HARM_BLOCK_UNLESS_UNSPECIFIED，Go 版 includes 判定）→ 配置值；
+  // 显式阈值原样保留
+  const vars2 = buildVertexVariables("gemini-3.6-flash", {
+    contents: [],
+    safetySettings: [
+      { category: "HARM_CATEGORY_HARASSMENT", threshold: "HARM_BLOCK_UNLESS_UNSPECIFIED" },
+      { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "block_low_and_above" },
+      { category: "HARM_CATEGORY_CIVIC_INTEGRITY" },
+    ],
+  }, { safetySettingsMap: configured });
+  const ss2 = vars2["safetySettings"] as Array<{ category: string; threshold: string }>;
+  assert.equal(ss2.length, 3);
+  assert.equal(ss2[0].threshold, "BLOCK_ONLY_HIGH"); // 含 UNSPECIFIED → 配置值
+  assert.equal(ss2[1].threshold, "BLOCK_LOW_AND_ABOVE"); // 小写归一为大写
+  assert.equal(ss2[2].threshold, "BLOCK_NONE"); // 缺失阈值 → BLOCK_NONE（未配置该类）
+});
+
 test("payload: chat 壳固定包壳 + recaptchaToken + 匿名 Key", () => {
   const payload = buildChatPayload("gemini-3.6-flash", { contents: [{ role: "user", parts: [{ text: "hi" }] }] }, "tok123");
   assert.equal(payload["operationName"], "StreamGenerateContentAnonymous");

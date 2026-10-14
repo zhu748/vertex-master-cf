@@ -4,7 +4,7 @@
 > **Cloudflare Workers（official 模式免费计划即可；anon + 代理池建议 Workers Standard）**。在 cf-vproxy
 > （同作者的 official 模式 Workers 精简版）基础上，**补齐了 anon 匿名端点模式**，并把出站代理层按其
 > 设计重写（`cloudflare:sockets` 隧道 + 纯 JS TLS 1.3 + 连接复用池 + 订阅拉取 + 对冲竞速）。
-> 当前版本 **v1.1.0**（Workers 平台专项调优，见下方「平台限制与调优」章节）。
+> 当前版本 **v1.2.0**（补齐 Go 版全部业务端点与 safety_settings 语义 + Workers 平台专项调优）。
 
 **两种上游通道（原项目 `gemini_api_mode` 语义，面板一键切换）：**
 
@@ -179,7 +179,7 @@ npm run dev         # wrangler dev 本地调试（cloudflare:sockets 走远程�
 npm run deploy      # 部署
 ```
 
-## ⚡ Cloudflare Workers 平台限制与调优（v1.1.0）
+## ⚡ Cloudflare Workers 平台限制与调优
 
 本项目针对 Workers 平台做了如下适配与优化，理解这些约束有助于选择合适的付费计划与配置：
 
@@ -197,6 +197,10 @@ npm run deploy      # 部署
 
 ## ⚠️ 与原项目（Go 版）的差异
 
+**v1.2.0 已逐行比对 Go 版路由表与配置结构补齐**：`/health`、`/keepalive`、`/api/hello`（Claude Code 网关探测）、`/favicon.ico`、`GET /v1beta/models/{model}`（Gemini 格式模型详情）、`safety_settings` 配置与 safetySettings 归一化（每个 anon 出站请求恒携带 5 类阈值，语义同 Go 版 `BuildVertexVariables`）。
+
+剩余差异（平台本质限制或面板 UX 取舍，不影响核心代理功能）：
+
 | 能力 | 原项目 | 本移植 | 原因 |
 |------|--------|--------|------|
 | anon 匿名端点 | ✅（Chrome TLS 指纹） | ✅（非浏览器 TLS 指纹，存在被拒风险） | Workers 沙箱无法伪装 TLS 指纹 |
@@ -206,6 +210,11 @@ npm run deploy      # 部署
 | TLS 指纹伪装 | ✅ | ❌ | 同上 |
 | SQLite 持久化 | ✅ | KV 快照（健康度/用量/日志） | Workers 无本地盘 |
 | 图片生成 imagen/veo（:predict） | official 直连 | ✅ official / ❌ anon | 匿名端点无 predict 操作签名 |
+| `request_timeout` 配置 | ✅（上游会话超时可配） | 固化常量（连接/握手/TLS/响应头分级超时） | Workers 分级超时已覆盖语义 |
+| `max_spill_mb`（磁盘 spool） | ✅ | ❌ | Workers 无磁盘；流式处理不落盘 |
+| 节点批量管理 UX（导入/排序/批量启停/测速进度） | ✅（面板内建） | 池管理走配置 + 订阅 + 巡检 | 面板为独立实现，核心池能力等价 |
+| 面板外观自定义（背景图/字体等） | ✅ | ❌ | 装饰性功能 |
+| `debug_pprof` / `debug_mode` | ✅ | ❌（Dashboard 观测日志替代） | Go 特有调试设施 |
 | 部署形态 | VPS/Docker/Termux | Cloudflare Workers（official 免费 / anon+代理池建议 Standard） | — |
 
 ## 📜 许可证
