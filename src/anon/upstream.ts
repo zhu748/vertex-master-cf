@@ -397,6 +397,96 @@ function anonCandidates(pool: ProxyPool | null): Array<ProxyEntry | null> {
   return [null];
 }
 
+/** chat 竞速终局：ok = 已有内容经 emit 流出（lastTerminal 为内容后错误） */
+interface ChatRaceResult {
+  ok: boolean;
+  lastTerminal: AnonUpstreamError | null;
+  last429: AnonUpstreamError | null;
+}
+
+/**
+ * v1.5.4：chat 候选并发竞速（Generate/Stream 共用骨架）。
+ * 每轮最多 ANON_MAX_CANDIDATES 个候选**并行**执行（各自独立隧道 + token，
+ * 互不干扰；Workers 同时连接数上限 6，3 候选 × 1 隧道安全）：
+ *   - 首个产出内容的候选成为 owner，其 chunk 经 emit 流出；其余候选立即中止；
+ *   - 全部 relay 且撞过 429 → 等待换轮重选候选（冷却让位 → 换 IP）再战；
+ *   - 跨轮预算 ANON_CANDIDATE_BUDGET 总控。
+ * 取代 v1.5.0 的顺序接力：全池限流场景下 429 返回时延从 ~48s 降至 ~15s，
+ * 成功场景下首个响应即用（不再被前排慢节点拖住）。
+ */
+async function raceChatCandidates(
+  ctx: HandlerCtx,
+  params: ChatParams,
+  emit: (chunk: Record<string, unknown>) => boolean,
+  signal?: AbortSignal,
+): Promise<ChatRaceResult> {
+  const maxRounds = anonMaxRounds(ctx.cfg);
+  let budget = ANON_CANDIDATE_BUDGET;
+  let lastTerminal: AnonUpstreamError | null = null;
+  let last429: AnonUpstreamError | null = null;
+
+  for (let round = 0; round < maxRounds && budget > 0; round++) {
+    if (round > 0) await anonRoundWait(ctx.pool);
+    const pool = anonCandidates(ctx.pool);
+    const cands = pool.filter(() => budget-- > 0);
+    if (cands.length === 0) break;
+
+    // 每候选独立 AbortController：owner 产生即中止其余候选（父 signal 中止全部）
+    const aborts = cands.map(() => new AbortController());
+    const onParentAbort = () => {
+      for (const a of aborts) a.abort();
+    };
+    signal?.addEventListener("abort", onParentAbort, { once: true });
+    let owner = -1; // 首个产出内容的候选
+    const abortLosers = (idx: number) => {
+      for (let j = 0; j < aborts.length; j++) {
+        if (j !== idx) aborts[j].abort();
+      }
+    };
+
+    const outcomes = await Promise.all(
+      cands.map(async (p, idx): Promise<CandidateOutcome> => {
+        if (aborts[idx].signal.aborted) return { kind: "relay" };
+        return await runChatCandidate(
+          p,
+          params,
+          (chunk) => {
+            if (owner === -1) {
+              owner = idx;
+              abortLosers(idx);
+            }
+            if (owner !== idx) return true; // 迟到的非 owner chunk：丢弃（其候选随即被中止）
+            return emit(chunk);
+          },
+          aborts[idx].signal,
+        );
+      }),
+    );
+    signal?.removeEventListener("abort", onParentAbort);
+
+    if (owner >= 0) {
+      // owner 完成：其 terminal（内容后错误）作为终局错误
+      const ownerOutcome = outcomes[owner];
+      return {
+        ok: true,
+        lastTerminal: ownerOutcome && ownerOutcome.kind === "terminal" ? ownerOutcome.err : null,
+        last429: null,
+      };
+    }
+    // 本轮无内容：汇总 relay/terminal 信息决定是否换轮
+    let round429 = false;
+    for (const out of outcomes) {
+      if (out.kind === "terminal") lastTerminal = out.err;
+      if (out.kind === "relay" && out.err?.status === 429) {
+        round429 = true;
+        last429 = out.err;
+      }
+    }
+    if (!round429) break; // 非 429 原因失败：重试无意义
+  }
+  return { ok: false, lastTerminal, last429 };
+}
+
 function terminalResponse(err: AnonUpstreamError): Response {
   const status = err.status >= 400 && err.status <= 599 ? err.status : 502;
   const geminiStatus =
@@ -411,9 +501,8 @@ function terminalResponse(err: AnonUpstreamError): Response {
 }
 
 /** anon 模式非流式 chat（generateContent / predict 类）：聚合为单个 Gemini 响应。
- *  v1.5.0：整轮 429 重试 —— 一轮全部候选撞 429 且还有轮次/预算时，等待后
- *  重新选候选再战（冷却节点让位 → 换 IP，每个 IP 独立配额窗口）；
- *  全轮耗尽仍 429 → 向客户端返回 429（而非 502），保留限流语义供重试。 */
+ *  v1.5.4：候选并发竞速（raceChatCandidates）—— 首个产出内容的候选胜出，
+ *  其余立即中止；全池 429 时快速换轮，耗尽返回 429（而非 502）。 */
 export async function callAnonGenerate(
   ctx: HandlerCtx,
   model: string,
@@ -433,53 +522,31 @@ export async function callAnonGenerate(
     url: batchGraphqlURL(anonOverrides(cfg)),
     safetySettingsMap: cfg.safety_settings,
   };
-  const maxRounds = anonMaxRounds(cfg);
-  let lastTerminal: AnonUpstreamError | null = null;
-  let last429: AnonUpstreamError | null = null;
-  let budget = ANON_CANDIDATE_BUDGET;
-  for (let round = 0; round < maxRounds && budget > 0; round++) {
-    if (round > 0) await anonRoundWait(ctx.pool);
-    const candidates = anonCandidates(ctx.pool);
-    let round429 = false;
-    for (const p of candidates) {
-      if (budget <= 0) break;
-      budget--;
-      const collector = new ChunkCollector();
-      const outcome = await runChatCandidate(
-        p,
-        params,
-        (chunk) => {
-          collector.add(chunk);
-          return true;
-        },
-        signal,
-      );
-      if (outcome.kind === "ok") {
-        const resp = collector.buildResponse();
-        if (!resp) {
-          continue; // 空响应：换候选
-        }
-        return json(resp);
-      }
-      if (outcome.kind === "terminal") lastTerminal = outcome.err;
-      if (outcome.kind === "relay" && outcome.err?.status === 429) {
-        round429 = true;
-        last429 = outcome.err;
-      }
-    }
-    if (!round429) break; // 本轮无 429：重试无意义（非限流原因失败）
+  const collector = new ChunkCollector();
+  const result = await raceChatCandidates(
+    ctx,
+    params,
+    (chunk) => {
+      collector.add(chunk);
+      return true;
+    },
+    signal,
+  );
+  if (result.ok && !result.lastTerminal) {
+    const resp = collector.buildResponse();
+    if (resp) return json(resp);
   }
-  if (lastTerminal) return terminalResponse(lastTerminal);
-  if (last429) {
-    return terminalResponse(new AnonUpstreamError(429, last429.body, "anon rate limited: all candidates exhausted (429)"));
+  if (result.lastTerminal) return terminalResponse(result.lastTerminal);
+  if (result.last429) {
+    return terminalResponse(new AnonUpstreamError(429, result.last429.body, "anon rate limited: all candidates exhausted (429)"));
   }
   return errGemini(502, "anon upstream failed: all candidates exhausted (no content)", "UNAVAILABLE");
 }
 
 /** anon 模式流式 chat（streamGenerateContent）：合成 Gemini 原生 SSE 流。
- *  v1.5.0：整轮 429 重试（同 callAnonGenerate）—— 全部候选撞 429 且还有
- *  轮次/预算时等待后重选候选再战；耗尽仍 429 且未产出内容 → 发送 429 错误帧
- *  （保留限流语义）后收流。 */
+ *  v1.5.4：候选并发竞速 + 推送式 ReadableStream —— 首个产出内容的候选胜出
+ *  （其 chunk 实时入队），其余候选立即中止；全池 429 快速换轮，耗尽发送
+ *  429 错误帧（保留限流语义）后收流。 */
 export async function callAnonStream(ctx: HandlerCtx, model: string, geminiPayload: Record<string, unknown>): Promise<Response> {
   // v1.4.1：同 callAnonGenerate —— 流式路径也先载入健康快照（含冷启动场景）
   await ensureHealthLoaded(ctx.env);
@@ -492,85 +559,43 @@ export async function callAnonStream(ctx: HandlerCtx, model: string, geminiPaylo
     url: batchGraphqlURL(anonOverrides(cfg)),
     safetySettingsMap: cfg.safety_settings,
   };
-  const maxRounds = anonMaxRounds(cfg);
-  let candidates = anonCandidates(ctx.pool);
-  let candidateIdx = 0;
-  let round = 0;
-  let budget = ANON_CANDIDATE_BUDGET;
-  let round429 = false;
-  let last429: AnonUpstreamError | null = null;
   const encoder = new TextEncoder();
   const abort = new AbortController();
-  let yieldedAny = false;
 
   const stream = new ReadableStream<Uint8Array>({
-    async pull(controller) {
+    async start(controller) {
       try {
-        for (;;) {
-          if (candidateIdx >= candidates.length || budget <= 0) {
-            // 本轮候选耗尽：429 且还有轮次与预算 → 等待后重选候选（换 IP）再战
-            if (round429 && candidateIdx >= candidates.length && round + 1 < maxRounds && budget > 0) {
-              round++;
-              await anonRoundWait(ctx.pool);
-              candidates = anonCandidates(ctx.pool);
-              candidateIdx = 0;
-              round429 = false;
-              continue;
-            }
-            // 全轮耗尽：未产出内容 → 错误帧（429 保留限流语义 / 其余 502）
-            if (!yieldedAny) {
-              const body = last429
-                ? terminalErrorBody(new AnonUpstreamError(429, last429.body, "anon rate limited: all candidates exhausted (429)"))
-                : { code: 502, message: "anon upstream failed: all candidates exhausted", status: "UNAVAILABLE" };
-              controller.enqueue(encoder.encode("data: " + JSON.stringify({ error: body }) + "\n\n"));
-            }
-            controller.close();
-            return;
+        const result = await raceChatCandidates(
+          ctx,
+          params,
+          (chunk) => {
+            if (Object.keys(chunk).length === 0) return true;
+            controller.enqueue(encoder.encode("data: " + JSON.stringify(chunk) + "\n\n"));
+            return true;
+          },
+          abort.signal,
+        );
+        if (result.ok) {
+          if (result.lastTerminal) {
+            // 已产出内容后的错误：作为终止帧
+            controller.enqueue(encoder.encode("data: " + JSON.stringify({ error: terminalErrorBody(result.lastTerminal) }) + "\n\n"));
           }
-          const p = candidates[candidateIdx++];
-          budget--;
-          const outcome = await runChatCandidate(
-            p,
-            params,
-            (chunk) => {
-              if (Object.keys(chunk).length === 0) return true;
-              controller.enqueue(encoder.encode("data: " + JSON.stringify(chunk) + "\n\n"));
-              yieldedAny = true;
-              return true;
-            },
-            abort.signal,
-          );
-          if (outcome.kind === "ok") {
-            controller.close();
-            return;
-          }
-          if (outcome.kind === "terminal") {
-            if (outcome.err.status === 499) {
-              // 客户端已断开：直接收流，不接力
-              controller.close();
-              return;
-            }
-            if (!yieldedAny) {
-              // 未产出任何内容：401/429 透传语义错误，其余接力语义
-              const status = outcome.err.status;
-              if (status === 401 || status === 403 || status === 429) {
-                controller.enqueue(encoder.encode("data: " + JSON.stringify({ error: terminalErrorBody(outcome.err) }) + "\n\n"));
-                controller.close();
-                return;
-              }
-              continue; // 接力
-            }
-            // 已产出内容：错误作为终止帧
-            controller.enqueue(encoder.encode("data: " + JSON.stringify({ error: terminalErrorBody(outcome.err) }) + "\n\n"));
-            controller.close();
-            return;
-          }
-          // relay：429 记录本轮限流标记，接力下一候选
-          if (outcome.err?.status === 429) {
-            round429 = true;
-            last429 = outcome.err;
-          }
+          controller.close();
+          return;
         }
+        // 无内容终局：401/403/429 语义透传，其余 502
+        const terminal = result.lastTerminal;
+        if (terminal && (terminal.status === 401 || terminal.status === 403 || terminal.status === 429)) {
+          controller.enqueue(encoder.encode("data: " + JSON.stringify({ error: terminalErrorBody(terminal) }) + "\n\n"));
+        } else if (result.last429) {
+          const err = new AnonUpstreamError(429, result.last429.body, "anon rate limited: all candidates exhausted (429)");
+          controller.enqueue(encoder.encode("data: " + JSON.stringify({ error: terminalErrorBody(err) }) + "\n\n"));
+        } else {
+          controller.enqueue(
+            encoder.encode("data: " + JSON.stringify({ error: { code: 502, message: "anon upstream failed: all candidates exhausted", status: "UNAVAILABLE" } }) + "\n\n"),
+          );
+        }
+        controller.close();
       } catch (err) {
         controller.error(err);
       }

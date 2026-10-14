@@ -4,8 +4,14 @@
 > **Cloudflare Workers（official 模式免费计划即可；anon + 代理池建议 Workers Standard）**。在 cf-vproxy
 > （同作者的 official 模式 Workers 精简版）基础上，**补齐了 anon 匿名端点模式**，并把出站代理层按其
 > 设计重写（`cloudflare:sockets` 隧道 + 纯 JS TLS 1.3 + 连接复用池 + 订阅拉取 + 对冲竞速）。
-> 当前版本 **v1.5.3**（Content-Encoding 解压 + TLS 应用数据接线 + verify-fail
-> 同 token 重试 + in-band 429 整轮换点重试 —— 代理隧道链路三层根因全部修复）。
+> 当前版本 **v1.5.4**（Content-Encoding 解压 + TLS 应用数据接线 + verify-fail
+> 同 token 重试 + in-band 429 处理 + 候选并发竞速 —— 代理隧道链路多层根因全部修复）。
+>
+> v1.5.4 变更（相对 v1.5.3）：
+>
+> | 改动 | 说明 |
+> |------|------|
+> | **anon 候选并发竞速** | chat 两入口（Generate/Stream）改用 `raceChatCandidates` 共用骨架：每轮最多 3 候选**并行**（各自独立隧道 + token，token-IP 绑定天然满足），首个产出内容的候选胜出、其余立即中止；流式路径改推送式 ReadableStream。取代顺序接力：全池限流时 429 返回时延 ~48s → ~15s，成功场景不被前排慢节点拖住。跨轮预算 `ANON_CANDIDATE_BUDGET=6` 总控（Workers 同时连接上限 6 内安全） |
 >
 > v1.5.3 变更（相对 v1.5.2）：
 >
