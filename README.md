@@ -4,8 +4,19 @@
 > **Cloudflare Workers（official 模式免费计划即可；anon + 代理池建议 Workers Standard）**。在 cf-vproxy
 > （同作者的 official 模式 Workers 精简版）基础上，**补齐了 anon 匿名端点模式**，并把出站代理层按其
 > 设计重写（`cloudflare:sockets` 隧道 + 纯 JS TLS 1.3 + 连接复用池 + 订阅拉取 + 对冲竞速）。
-> 当前版本 **v1.4.2**（健康分新鲜度衰减 + recaptcha 响应体限时读取：陈旧成功记录
-> 不再把死节点顶到候选最前，死隧道快速失败接力）。
+> 当前版本 **v1.5.0**（anon 无头链路根因修复：verify-fail 首帧预期同 token 重试 +
+> in-band 429 识别与整轮换点重试 —— 实测确认无头链路本身完好，此前失败仅为
+> 429 限流未被正确分类处理）。
+>
+> v1.5.0 变更（相对 v1.4.2）：
+>
+> | 改动 | 说明 |
+> |------|------|
+> | **verify-fail 同 token 首验重试（根因）** | 匿名端点每个新 recaptcha token 的首次调用**必然**返回 in-band `"Failed to verify action"`（Go 版注释明确：首帧预期 verify-fail），同 token 500ms 后重发即通过验证。旧版 CF 移植在 in-band 路径直接丢弃 token 换新 token —— 每个新 token 又从首帧开始撞 verify-fail，形成死循环（HTTP 状态码路径本有首验重试，但 in-band 帧路径漏了）。现三条链路（Generate/Stream/CountTokens）全部对齐 Go `stream.go`/`counttokens.go`：首验失败同 token 重试一次；再失败换 token 并重置首验标记（新 token 首帧同样预期 verify-fail） |
+> | **in-band 429 识别** | 匿名端点限流以 in-band 形式出现：HTTP 200 + `results[].errors` 携 gRPC `code 8` `"Resource has been exhausted (e.g. check quota)"`。新增 `parseInBandErrors`（移植 Go `parseErrorResponse` GraphQL 分支）+ `mapInBandStatus`（gRPC/HTTP 状态映射，移植 `raiseForStatus`）：code 8 / RESOURCE_EXHAUSTED → 429。旧版落入「无结构化错误」分支静默跳过 → 节点不冷却、不换点、客户端拿 502 |
+> | **anon 整轮 429 重试** | chat 三入口与 countTokens 均多轮化（复用 `racing.rate_limit_retries` 配置，钳 1~3 轮）：一轮全部候选撞 429 → 记节点限流冷却 → 等待（池内有活节点立即换点，全池冷却等最早恢复，钳 250ms~8s + 抖动）→ 重新 `orderedCandidates` 选点再战 —— 冷却节点自然沉底，天然换 IP（每个代理 IP 独立配额窗口） |
+> | **429 语义透传** | 全轮耗尽仍 429 → 向客户端返回 429/RESOURCE_EXHAUSTED（旧版误报 502），保留限流语义供客户端重试 |
+> | **子请求预算** | 新增 `ANON_CANDIDATE_BUDGET=6`（跨轮候选调用上限，每次约 3~5 个 socket），极端场景不会打爆免费版 50 子请求/请求限额 |
 >
 > v1.4.2 变更（相对 v1.4.1）：
 >

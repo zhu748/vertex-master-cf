@@ -182,6 +182,48 @@ function toStr(v: unknown): string {
 
 const META_KEYS = new Set(["usageMetadata", "modelVersion", "responseId", "promptFeedback", "createTime"]);
 
+// ---------- v1.5.0：in-band 错误解析（移植 Go parseErrorResponse GraphQL 分支 + raiseForStatus） ----------
+
+/** gRPC/HTTP 状态映射（移植 Go raiseForStatus）：返回对外 HTTP 状态码。
+ *  匿名端点的配额限流以 in-band 形式出现（HTTP 200 + gRPC code 8
+ *  "Resource has been exhausted (e.g. check quota)"）—— 必须映射为 429 才能触发
+ *  上层的节点限流冷却 + 换点重试 + 最终 429 透传。 */
+export function mapInBandStatus(code: number, status: string): number {
+  const s = (status || "").toUpperCase();
+  if (s === "RESOURCE_EXHAUSTED" || code === 8 || code === 429) return 429;
+  if (s === "UNAUTHENTICATED" || code === 16 || code === 401) return 401;
+  if (s === "PERMISSION_DENIED" || code === 7 || code === 403) return 403;
+  if (s === "INVALID_ARGUMENT" || code === 3 || code === 400) return 400;
+  if (s === "NOT_FOUND" || code === 5 || code === 404) return 404;
+  if (s === "UNAVAILABLE" || code === 14 || code === 503) return 503;
+  if (code >= 400 && code < 500) return code;
+  return code >= 500 ? code : 500;
+}
+
+function toIntLike(v: unknown, def: number): number {
+  if (typeof v === "number" && Number.isFinite(v)) return Math.trunc(v);
+  if (typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v))) return Math.trunc(Number(v));
+  return def;
+}
+
+/** GraphQL 风格 in-band errors 数组解析（移植 Go parseErrorResponse case 2）：
+ *  优先 extensions.status.{code,status,message}，回退首元素扁平字段。
+ *  解析不出结构化错误返回 null（调用方继续处理后续 result，对齐 Go）。 */
+export function parseInBandErrors(errs: unknown[]): { status: number; code: number; message: string } | null {
+  const first = errs[0];
+  if (!first || typeof first !== "object" || Array.isArray(first)) return null;
+  const e = first as Record<string, unknown>;
+  const ext = e["extensions"];
+  const extObj = ext && typeof ext === "object" && !Array.isArray(ext) ? (ext as Record<string, unknown>) : {};
+  const extStatus = extObj["status"];
+  const st = extStatus && typeof extStatus === "object" && !Array.isArray(extStatus) ? (extStatus as Record<string, unknown>) : {};
+  const code = toIntLike(st["code"] !== undefined ? st["code"] : e["code"], 500);
+  const status = toStr(st["status"] !== undefined ? st["status"] : e["status"]);
+  const rawMsg = st["message"] !== undefined ? st["message"] : e["message"];
+  const message = toStr(rawMsg) || "Unknown error";
+  return { status: mapInBandStatus(code, status), code, message };
+}
+
 /** 处理单个上游 JSON 对象，产出（可能多个）Gemini chunk。返回 false = 停止（客户端断开）。 */
 export function processStreamingObject(
   obj: Record<string, unknown>,
@@ -193,7 +235,9 @@ export function processStreamingObject(
     const result = rRaw as Record<string, unknown>;
 
     // results 内错误处理：verify-fail / permission → auth 错误触发上层重试；
-    // 其余错误不中断（对齐 Go 版：parseErrorResponse 未命中时继续处理后续 result）
+    // 其余结构化错误 v1.5.0 起抛出（对齐 Go parseErrorResponse：配额限流 code 8
+    // 必须成为 429，否则节点不会冷却、客户端也拿不到真实限流语义）；
+    // 解析不出结构化错误则继续处理后续 result
     const errs = result["errors"];
     if (Array.isArray(errs) && errs.length > 0) {
       const first = errs[0];
@@ -201,6 +245,8 @@ export function processStreamingObject(
       if (errMsg.includes("Failed to verify action") || errMsg.includes("The caller does not have permission")) {
         throw new AnonAuthError(errMsg);
       }
+      const parsed = parseInBandErrors(errs);
+      if (parsed) throw new AnonUpstreamError(parsed.status, JSON.stringify(errs), parsed.message);
       continue;
     }
 

@@ -421,8 +421,9 @@ export class PoolRateLimitedError extends Error {
 }
 
 /** v1.4.0：整轮 429 重试前的等待 —— 池内还有可选节点（非冷却/未测试）时
- *  立即换点再战（0ms）；全池冷却时等到最早恢复者（钳 250ms~8s）。 */
-function poolRoundWaitMs(pool: ProxyPool): number {
+ *  立即换点再战（0ms）；全池冷却时等到最早恢复者（钳 250ms~8s）。
+ *  v1.5.0 起导出：anon 候选接力维度复用同一等待语义。 */
+export function poolRoundWaitMs(pool: ProxyPool): number {
   const now = Date.now();
   const cooldowns: number[] = [];
   for (const e of pool.entries) {
