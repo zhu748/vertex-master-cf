@@ -45,6 +45,25 @@ async function readLimited(resp: Response): Promise<string> {
   return new TextDecoder().decode(buf);
 }
 
+/**
+ * v1.4.2：限时版整读 —— 响应头已到但 body 停滞（死隧道/慢代理）时，直接以
+ * 超时错误失败并接力下一候选，不再无限等待。viaProxy 的头部超时（120s）
+ * 管不到 body 读，此前这里是整条 anon 链路最长的无界挂起点。
+ */
+const RECAPTCHA_BODY_TIMEOUT_MS = 15_000;
+
+async function readLimitedTimed(resp: Response): Promise<string> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("recaptcha: response body timeout")), RECAPTCHA_BODY_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([readLimited(resp), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function getViaTransport(
   url: string,
   headers: Record<string, string>,
@@ -54,10 +73,10 @@ async function getViaTransport(
   if (transport.proxies.length > 0) {
     const p = transport.proxies[0];
     const resp = await viaProxy(p, url, { method: "GET", headers }, signal);
-    return { status: resp.status, body: await readLimited(resp) };
+    return { status: resp.status, body: await readLimitedTimed(resp) };
   }
   const resp = await fetch(url, { method: "GET", headers, signal });
-  return { status: resp.status, body: await readLimited(resp) };
+  return { status: resp.status, body: await readLimitedTimed(resp) };
 }
 
 async function postViaTransport(
@@ -70,10 +89,10 @@ async function postViaTransport(
   if (transport.proxies.length > 0) {
     const p = transport.proxies[0];
     const resp = await viaProxy(p, url, { method: "POST", headers, body }, signal);
-    return { status: resp.status, body: await readLimited(resp) };
+    return { status: resp.status, body: await readLimitedTimed(resp) };
   }
   const resp = await fetch(url, { method: "POST", headers, body, signal });
-  return { status: resp.status, body: await readLimited(resp) };
+  return { status: resp.status, body: await readLimitedTimed(resp) };
 }
 
 /** 单次 anchor + reload 交换 */

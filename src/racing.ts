@@ -201,6 +201,10 @@ function decayCounters(h: ProxyHealth): void {
  *       分散到全池（375+ 节点轮换 ≈ 接近无限额度）；计数由 decayCounters 周期减半
  *       清理，节点长期正常服务后自动回到高位。
  */
+/** v1.4.2：成功记录新鲜度 —— 6h 宽限期内全额计分，6h~24h 线性衰减到 0 */
+const STALE_GRACE_SEC = 6 * 3600;
+const STALE_ZERO_SEC = 24 * 3600; // 与 HEALTH_TTL_SEC 对齐：超过一天的快照本就不加载
+
 export function healthScore(h: ProxyHealth | undefined, now: number): number {
   if (isCooling(h, now)) return 0; // 冷却中（防御：优先于未测试判断）
   if (!h || (h.last_success_at === 0 && h.last_fail_at === 0)) return 80; // 未测试
@@ -210,7 +214,19 @@ export function healthScore(h: ProxyHealth | undefined, now: number): number {
   const failPenalty = 8 * Math.min(h.consec_fail, 5);
   const rlPenalty = 5 * Math.min(h.rate_limit_count, 6);
   const stickyBonus = h.sticky ? 15 : 0;
-  return 60 + 20 * rate + latencyBonus - failPenalty - rlPenalty + stickyBonus;
+  // v1.4.2：成功侧加分（成功率/延迟/粘性）按最近一次成功的新鲜度衰减 ——
+  // 数天前巡检残留的陈旧成功不再把早已死掉的节点顶到未测试节点（80 分）之前；
+  // 基础分 60 与失败/限流惩罚不衰减：已知坏节点依旧垫底。举例：16 天前
+  // success=2 的节点从 ~86 分降到 60 分（未测试档之下），接力顺序自动让位给
+  // 新鲜血液，新 isolate 冷启动不再优先撞死节点。
+  const ageSec = h.last_success_at > 0 ? now / 1000 - h.last_success_at : Infinity;
+  const ageFactor =
+    ageSec <= STALE_GRACE_SEC
+      ? 1
+      : ageSec >= STALE_ZERO_SEC
+        ? 0
+        : 1 - (ageSec - STALE_GRACE_SEC) / (STALE_ZERO_SEC - STALE_GRACE_SEC);
+  return 60 + (20 * rate + latencyBonus + stickyBonus) * ageFactor - failPenalty - rlPenalty;
 }
 
 export function isCooling(h: ProxyHealth | undefined, now: number): boolean {
